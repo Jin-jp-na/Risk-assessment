@@ -1,0 +1,41 @@
+{
+  "5beb209d-e738-4f54-b09a-877e98256e7f": {
+    "scan_id": "5beb209d-e738-4f54-b09a-877e98256e7f",
+    "target": "testphp.vulnweb.com",
+    "status": "completed",
+    "message": "Scan fully completed.",
+    "exposure": "auto",
+    "exposure_effective": "external",
+    "gobuster_status": "completed",
+    "profile": "standard",
+    "description": null,
+    "created_at": "2026-10-03T13:24:31.198217+00:00",
+    "completed_at": "2026-10-03T13:26:52.217634+00:00"
+  },
+  "d2d4a153-d5af-4c3c-b54a-42dc25de0217": {
+    "scan_id": "d2d4a153-d5af-4c3c-b54a-42dc25de0217",
+    "target": "sauravprajapati.com.np",
+    "status": "completed",
+    "message": "Scan fully completed.",
+    "exposure": "auto",
+    "exposure_effective": "external",
+    "gobuster_status": "completed",
+    "profile": "standard",
+    "description": null,
+    "created_at": "2026-10-05T18:32:26.843635+00:00",
+    "completed_at": "2026-10-05T18:33:09.304825+00:00"
+  },
+  "3565b29e-0062-4cd4-a335-349db4687520": {
+    "scan_id": "3565b29e-0062-4cd4-a335-349db4687520",
+    "target": "facebook.com",
+    "status": "completed",
+    "message": "Scan fully completed.",
+    "exposure": "auto",
+    "exposure_effective": "external",
+    "gobuster_status": "completed",
+    "profile": "standard",
+    "description": null,
+    "created_at": "2026-10-05T18:36:19.113227+00:00",
+    "completed_at": "2026-10-05T18:37:22.304478+00:00"
+  }
+}

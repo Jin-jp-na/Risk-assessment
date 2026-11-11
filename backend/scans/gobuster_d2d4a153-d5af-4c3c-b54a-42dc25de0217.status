@@ -1,0 +1,4 @@
+{
+  "summary": "Gobuster completed with warnings; partial results are available.",
+  "detail": "2026/10/06 00:18:07 the server returns a status code that matches the provided options for non existing urls. https://sauravprajapati.com.np/256c7c2b-ca60-4f05-8675-533003dc236c => 301 (redirect to https://www.sauravprajapati.com.np/256c7c2b-ca60-4f05-8675-533003dc236c) (Length: 167). Please exclude the response length or the status code or set the wildcard option.. To continue please exclude the status code or the length"
+}

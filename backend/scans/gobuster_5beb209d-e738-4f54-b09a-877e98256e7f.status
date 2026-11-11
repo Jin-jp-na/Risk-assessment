@@ -1,0 +1,4 @@
+{
+  "summary": "Gobuster completed with warnings; partial results are available.",
+  "detail": "2026/10/03 19:11:50 error on running gobuster on https://testphp.vulnweb.com/: timeout occurred during the request"
+}

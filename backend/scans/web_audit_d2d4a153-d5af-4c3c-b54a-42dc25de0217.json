@@ -1,0 +1,79 @@
+{
+  "url": "http://sauravprajapati.com.np",
+  "http": {
+    "status": 200,
+    "final_url": "https://www.sauravprajapati.com.np/",
+    "headers": {
+      "Date": "Mon, 05 Oct 2026 18:32:52 GMT",
+      "Content-Type": "text/html; charset=utf-8",
+      "Transfer-Encoding": "chunked",
+      "Connection": "keep-alive",
+      "Server": "cloudflare",
+      "last-modified": "Mon, 27 Oct 2025 15:30:15 GMT",
+      "access-control-allow-origin": "*",
+      "expires": "Mon, 05 Oct 2026 18:42:51 GMT",
+      "Cache-Control": "max-age=600",
+      "Report-To": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=%2FGCoLokYbwCNdzUkpSvPgY%2BSUzq49CvvdKaxc%2FePYmXpe%2FXuh4%2BVCR2UTtiUPCalzgzgCXGekwmSBJOYWi7eRYQiJAdGpvmf27FgJKdGB9RovLK%2B4hkxL%2BcwLHj3U5jUsNt0L8dkKa%2F34UK66g%3D%3D\"}]}",
+      "x-proxy-cache": "MISS",
+      "x-github-request-id": "7874:615C6:1084A5:10FE09:6AC3ED53",
+      "x-github-edge-region": "centralindia",
+      "Nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+      "Age": "0",
+      "via": "1.1 varnish",
+      "x-served-by": "cache-bom-vanm7210087-BOM",
+      "x-cache": "MISS",
+      "x-cache-hits": "0",
+      "x-timer": "S1791225172.827959,VS0,VE236",
+      "vary": "Accept-Encoding",
+      "x-fastly-request-id": "7c427805773750051200066a05bf64ad6b01eae1",
+      "cf-cache-status": "DYNAMIC",
+      "Content-Encoding": "zstd",
+      "CF-RAY": "a45e82eb486f0c4d-KTM",
+      "alt-svc": "h3=\":443\"; ma=86400"
+    }
+  },
+  "tls": {},
+  "technologies": [
+    {
+      "name": "Server",
+      "evidence": "cloudflare"
+    }
+  ],
+  "checks": [
+    {
+      "name": "HSTS",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "Content-Security-Policy",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "X-Content-Type-Options",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "X-Frame-Options",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "Referrer-Policy",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "Permissions-Policy",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "Server disclosure",
+      "status": "review",
+      "detail": "Server header is exposed: cloudflare"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "url": "http://testphp.vulnweb.com",
+  "http": {},
+  "tls": {},
+  "technologies": [],
+  "checks": [],
+  "error": "HTTPConnectionPool(host='testphp.vulnweb.com', port=80): Max retries exceeded with url: / (Caused by ConnectTimeoutError(<HTTPConnection(host='testphp.vulnweb.com', port=80) at 0x28ca9b44980>, 'Connection to testphp.vulnweb.com timed out. (connect timeout=15)'))"
+}
