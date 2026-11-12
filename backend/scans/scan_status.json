@@ -37,5 +37,44 @@
     "description": null,
     "created_at": "2026-10-05T18:36:19.113227+00:00",
     "completed_at": "2026-10-05T18:37:22.304478+00:00"
+  },
+  "5190313b-f4aa-47ae-9614-4756c92c474f": {
+    "scan_id": "5190313b-f4aa-47ae-9614-4756c92c474f",
+    "target": "192.168.1.0/24",
+    "status": "failed",
+    "message": "CIDR scan failed: [WinError 2] The system cannot find the file specified",
+    "exposure": "auto",
+    "exposure_effective": "internal",
+    "gobuster_status": "skipped",
+    "profile": "standard",
+    "description": null,
+    "created_at": "2026-11-11T01:38:30.966894+00:00",
+    "completed_at": null
+  },
+  "c9afe5aa-8151-461f-978f-542aa8415043": {
+    "scan_id": "c9afe5aa-8151-461f-978f-542aa8415043",
+    "target": "192.168.1.0/24",
+    "status": "failed",
+    "message": "CIDR scan failed: [WinError 2] The system cannot find the file specified",
+    "exposure": "internal",
+    "exposure_effective": "internal",
+    "gobuster_status": "skipped",
+    "profile": "standard",
+    "description": null,
+    "created_at": "2026-11-11T01:38:44.375769+00:00",
+    "completed_at": null
+  },
+  "081dbb04-1fea-4d82-8618-34ec86d4b9e6": {
+    "scan_id": "081dbb04-1fea-4d82-8618-34ec86d4b9e6",
+    "target": "192.168.1.0/24",
+    "status": "failed",
+    "message": "CIDR scan failed: [WinError 2] The system cannot find the file specified",
+    "exposure": "internal",
+    "exposure_effective": "internal",
+    "gobuster_status": "skipped",
+    "profile": "quick",
+    "description": null,
+    "created_at": "2026-11-11T01:47:10.838311+00:00",
+    "completed_at": null
   }
 }
