@@ -1,0 +1,4 @@
+{
+  "summary": "Gobuster completed with warnings; partial results are available.",
+  "detail": "2026/11/12 13:32:24 error on running gobuster on https://192.168.1.10/: timeout occurred during the request"
+}

@@ -44,7 +44,7 @@ def infer_exposure_from_target(target: str) -> str:
         return "external"
 
 NMAP_PATH = r"C:\Program Files (x86)\Nmap\nmap.exe"
-IPSCAN_PATH = r"C:\Tools\AngryIP\ipscan.exe"  # ✅ add here
+IPSCAN_PATH = r"C:\Tools\AngryIP\ipscan.exe"  # add here
 
 BASE_DIR = Path(__file__).resolve().parent
 SCANS_DIR = BASE_DIR / "scans"
@@ -103,7 +103,7 @@ class ScanStatus(BaseModel):
     message: Optional[str] = None
     exposure: Optional[str] = "auto"
     exposure_effective: Optional[str] = None
-    gobuster_status: Optional[str] = "pending"  # ✅ track gobuster separately
+    gobuster_status: Optional[str] = "pending"  # track gobuster separately
     profile: str = "standard"
     description: Optional[str] = None
     created_at: str = ""
@@ -190,7 +190,7 @@ def run_angry_ip_discovery(scan_id: str, subnet: str) -> list[str]:
         capture_output=True,
         text=True,
         timeout=300,
-        creationflags=subprocess.CREATE_NO_WINDOW,  # ✅ hide Angry IP window
+        creationflags=subprocess.CREATE_NO_WINDOW,  #  hide Angry IP window
         startupinfo=startupinfo,
     )
 
@@ -262,7 +262,7 @@ def run_nmap_scan_multi(scan_id: str, targets: List[str], ports: Optional[str] =
             fallback = [arg for arg in cmd if arg not in ("-O", "--osscan-guess")]
             subprocess.run(fallback, check=True, capture_output=True)
 
-        # ✅ Atomic replace: endpoints will only see a complete XML
+        #  Atomic replace: endpoints will only see a complete XML
         if not tmp_file.exists() or tmp_file.stat().st_size < 100:
             raise RuntimeError("Nmap did not produce a valid XML output file.")
 
@@ -338,7 +338,7 @@ def run_cidr_scan(
         scan_status_store[scan_id] = st
         _save_scan_status_store()
 
-        # ✅ IMPORTANT: run one Nmap scan for all alive hosts -> scans/<scan_id>.xml
+        # IMPORTANT: run one Nmap scan for all alive hosts -> scans/<scan_id>.xml
         run_nmap_scan_multi(scan_id, alive_hosts, ports=ports)
 
         # run_nmap_scan_multi updates scan status to completed/failed and saves it
@@ -573,7 +573,7 @@ def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     except Exception:
         pass
 
-    # ✅ ADD THIS (CIDR subnet scan)
+    # ADD THIS (CIDR subnet scan)
     if is_cidr_target(request.target):
         scan_id = str(uuid4())
         ports = (request.ports or "").strip() or None
@@ -596,7 +596,7 @@ def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
 
         background_tasks.add_task(run_cidr_scan, scan_id, request.target, ports)
         return status
-    # ✅ END CIDR BLOCK
+    #  END CIDR BLOCK
 
     host, implied_port, scheme = parse_target_and_port(request.target)
 
@@ -617,7 +617,7 @@ def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     profile = request.profile if request.profile in {"quick", "standard", "vulnerability", "web", "full"} else "standard"
     status = ScanStatus(
         scan_id=scan_id,
-        target=host,  # ✅ store clean host (not host:port)
+        target=host,  #  store clean host (not host:port)
         status="pending",
         message="Nmap + Gobuster scan scheduled",
         exposure=exposure_choice,
@@ -629,10 +629,10 @@ def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     scan_status_store[scan_id] = status
     _save_scan_status_store()
 
-    # ✅ Nmap: scan host, optionally specific ports
+    #  Nmap: scan host, optionally specific ports
     background_tasks.add_task(run_nmap_scan, scan_id=scan_id, target=host, ports=ports)
 
-    # ✅ Gobuster: build URL including scheme and port (if single port)
+    # Gobuster: build URL including scheme and port (if single port)
     netloc = host
     if ports and ports.isdigit():
         netloc = f"{host}:{ports}"
@@ -661,7 +661,7 @@ def get_scan_status(scan_id: str):
     nmap_done = xml_path.exists() and xml_path.stat().st_size > 100
     gobuster_done = done_path.exists()
 
-    # ✅ CIDR scans skip gobuster, so don't wait for gobuster_.done
+    #  CIDR scans skip gobuster, so don't wait for gobuster_.done
     if status.gobuster_status == "skipped":
         gobuster_done = True
 
@@ -706,7 +706,7 @@ def parse_nmap_xml(xml_path: Path) -> dict:
     if not xml_path.exists():
         raise FileNotFoundError(f"XML file not found: {xml_path}")
 
-    # ✅ Wait a bit if Nmap is still writing the file (prevents truncated XML parse)
+    #  Wait a bit if Nmap is still writing the file (prevents truncated XML parse)
     xml_content = ""
     for _ in range(20):  # 20 * 0.5s = 10 seconds max wait
         with open(xml_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1047,7 +1047,7 @@ def run_gobuster_scan(scan_id: str, url: str) -> None:
     done_path = SCANS_DIR / f"gobuster_{scan_id}.done"
     SCANS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ✅ Mark gobuster as running
+    #  Mark gobuster as running
     scan_st = scan_status_store.get(scan_id)
     if scan_st:
         scan_st.gobuster_status = "running"
@@ -1127,13 +1127,13 @@ def run_gobuster_scan(scan_id: str, url: str) -> None:
         except Exception as e:
             print(f"[GOBUSTER] Failed to write .done file: {e}")
 
-        # ✅ Mark gobuster status accurately
+        # Mark gobuster status accurately
         scan_st = scan_status_store.get(scan_id)
         if scan_st:
             scan_st.gobuster_status = "failed" if gobuster_failed else "completed"
             scan_status_store[scan_id] = scan_st
             _save_scan_status_store()
-# ✅ Now checks .done file instead of .txt file
+# Now checks .done file instead of .txt file
 @app.get("/webscan/{scan_id}", response_model=WebScanStatus)
 def get_web_scan_status(scan_id: str):
     done_path = SCANS_DIR / f"gobuster_{scan_id}.done"

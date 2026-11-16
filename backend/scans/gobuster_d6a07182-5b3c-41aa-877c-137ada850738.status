@@ -1,0 +1,4 @@
+{
+  "summary": "Gobuster completed with warnings; partial results are available.",
+  "detail": "2026/11/12 14:31:37 the server returns a status code that matches the provided options for non existing urls. https://facebook.com/c0b66c46-b8d1-4001-968a-a89421c2c2a0 => 301 (redirect to https://www.facebook.com/c0b66c46-b8d1-4001-968a-a89421c2c2a0) (Length: 0). Please exclude the response length or the status code or set the wildcard option.. To continue please exclude the status code or the length"
+}
