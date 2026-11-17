@@ -1,0 +1,89 @@
+{
+  "url": "http://paramiko.org",
+  "http": {
+    "status": 200,
+    "final_url": "https://www.paramiko.org/",
+    "headers": {
+      "Date": "Thu, 12 Nov 2026 17:33:53 GMT",
+      "Content-Type": "text/html; charset=utf-8",
+      "Transfer-Encoding": "chunked",
+      "Connection": "keep-alive",
+      "CF-Ray": "a59748c67d9e094f-IAD",
+      "CF-Cache-Status": "HIT",
+      "Access-Control-Allow-Origin": "*",
+      "Age": "1743",
+      "Cache-Control": "max-age=1800, stale-if-error=86400, public",
+      "Content-Encoding": "gzip",
+      "ETag": "\"ac9c717161bb3cf1a5ac8336aee421f8\"",
+      "Expires": "Thu, 12 Nov 2026 18:03:53 GMT",
+      "Last-Modified": "Sat, 09 May 2026 18:29:30 GMT",
+      "Server": "cloudflare",
+      "Vary": "Accept-Encoding",
+      "access-control-allow-methods": "HEAD, OPTIONS, GET",
+      "cdn-cache-control": "public, max-age=1800, stale-if-error=86400",
+      "cross-origin-opener-policy": "same-origin",
+      "referrer-policy": "no-referrer-when-downgrade",
+      "x-amz-id-2": "mAn5cLoI5esG/CkusplqObJ1xH8nf2hQeK768fbwtfgJIBQxscxCoWyn0QABw7hkYtIic4ymBdJzkgTA7j11cyNFfm2uzZCJ",
+      "x-amz-meta-mtime": "1778351367.995182005",
+      "x-amz-request-id": "BWSE6PA4MTJ6R1X1",
+      "x-amz-server-side-encryption": "AES256",
+      "x-backend": "web-i-04d08f97af34b456e",
+      "x-content-type-options": "nosniff",
+      "x-rtd-domain": "www.paramiko.org",
+      "x-rtd-force-addons": "true",
+      "x-rtd-path": "/proxito/html/paramiko-www/latest/index.html",
+      "x-rtd-project": "paramiko-www",
+      "x-rtd-project-method": "custom_domain",
+      "x-rtd-resolver-filename": "/",
+      "x-rtd-version": "latest",
+      "x-rtd-version-method": "path",
+      "x-served": "Nginx-Proxito-Sendfile",
+      "set-cookie": "__cf_bm=HvseQwEZLOd8TDgcD94SfjGQ2YCesfC38wtUNbWWmXw-1794504833.0332277-1.0.1.1-id8LOv147l368ciiINa5qTnh0cDAJ13vwF12Bl8c4QuMJMLe8AUd5B7EOmD2I1NGz1qsnQoEg5RLZF6A8I97k2ja6mUx2ac78S652ij3039q9dlkrMWUNlAvcHJ5SpBc; HttpOnly; SameSite=None; Partitioned; Secure; Path=/; Domain=www.paramiko.org; Expires=Thu, 12 Nov 2026 18:03:53 GMT",
+      "alt-svc": "h3=\":443\"; ma=86400"
+    }
+  },
+  "tls": {},
+  "technologies": [
+    {
+      "name": "Server",
+      "evidence": "cloudflare"
+    }
+  ],
+  "checks": [
+    {
+      "name": "HSTS",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "Content-Security-Policy",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "X-Content-Type-Options",
+      "status": "pass",
+      "detail": "Header present"
+    },
+    {
+      "name": "X-Frame-Options",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "Referrer-Policy",
+      "status": "pass",
+      "detail": "Header present"
+    },
+    {
+      "name": "Permissions-Policy",
+      "status": "missing",
+      "detail": "Security header is missing"
+    },
+    {
+      "name": "Server disclosure",
+      "status": "review",
+      "detail": "Server header is exposed: cloudflare"
+    }
+  ]
+}

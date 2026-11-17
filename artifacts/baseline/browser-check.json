@@ -1,0 +1,25 @@
+{
+  "url": "http://127.0.0.1:8787",
+  "health_status": 200,
+  "root_status": 200,
+  "desktop_viewport": {
+    "width": 1440,
+    "height": 1000
+  },
+  "mobile_viewport": {
+    "width": 390,
+    "height": 844
+  },
+  "screenshots": [
+    "01-overview-desktop.png",
+    "02-services-desktop.png",
+    "03-findings-desktop.png",
+    "04-attack-graph-desktop.png",
+    "05-web-scan-desktop.png",
+    "06-history-desktop.png",
+    "07-overview-mobile.png"
+  ],
+  "page_errors": [],
+  "blocked_non_read_requests": [],
+  "scans_started": 0
+}

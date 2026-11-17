@@ -1,0 +1,2231 @@
+diff --git a/backend/delta_engine.py b/backend/delta_engine.py
+new file mode 100644
+--- /dev/null
++++ b/backend/delta_engine.py
+@@ -0,0 +1,102 @@
++"""Compare evidence only. Missing coverage never proves an exposure was fixed."""
++
++SECURITY_HEADERS = {"strict-transport-security", "content-security-policy", "x-content-type-options",
++                    "x-frame-options", "referrer-policy", "permissions-policy"}
++
++
++class IncompatibleScans(ValueError):
++    pass
++
++
++def _closed(network, key):
++    host, protocol, port = key
++    for observation in network.get("observations", []):
++        if (observation.get("host"), observation.get("protocol"), observation.get("port")) == key:
++            return observation.get("state") == "closed"
++    # Only unambiguous closed extraports for an up host justify an omitted port.
++    coverage = network.get("coverage", {})
++    scanned = coverage.get("scanned_ports", {}).get(protocol, [])
++    if port not in scanned:
++        return False
++    for item in network.get("hosts", []):
++        if item.get("ip") == host:
++            explicit = sum(1 for value in network.get("observations", []) if value.get("host") == host and value.get("protocol") == protocol)
++            return (len(coverage.get("scanned_ports", {})) == 1 and item.get("state") == "up"
++                    and item.get("omitted_port_states") == ["closed"]
++                    and item.get("omitted_port_count") == len(scanned) - explicit > 0)
++    return False
++
++
++def compare_snapshots(old, new):
++    if old.get("identity", {}).get("target_key") != new.get("identity", {}).get("target_key"):
++        raise IncompatibleScans("Requested target identities differ")
++    if not old.get("identity", {}).get("targets") or old.get("identity", {}).get("targets") != new.get("identity", {}).get("targets"):
++        raise IncompatibleScans("Saved target identities differ or are unknown")
++    old_origin, new_origin = old["identity"].get("web_origin"), new["identity"].get("web_origin")
++    if old_origin and new_origin and old_origin != new_origin:
++        raise IncompatibleScans("Web scheme, IP and port must match")
++    result = {"schema_version": 1, "old_id": old["scan_id"], "new_id": new["scan_id"],
++              "target": new.get("target"), "added": [], "removed": [], "changed": [], "uncertain": [], "coverage": {}}
++
++    def event(bucket, component, kind, key, before, after, reason):
++        result[bucket].append({"component": component, "kind": kind, "key": str(key),
++                               "before": before, "after": after, "reason": reason,
++                               "interpretation": "Exposure observation change; no vulnerability or remediation confirmation."})
++
++    def compatible(component):
++        a, b = old["components"][component], new["components"][component]
++        okay = a["status"] == b["status"] == "completed"
++        if component != "network":
++            okay = okay and bool(a.get("origin")) and a.get("origin") == b.get("origin")
++        if component == "paths":
++            okay = okay and a.get("coverage") == b.get("coverage") and a.get("coverage", {}).get("words") is not None
++        if component == "http":
++            okay = okay and a.get("response", {}).get("status") == b.get("response", {}).get("status")
++        result["coverage"][component] = {"before": a["status"], "after": b["status"], "compatible": okay}
++        if not okay:
++            event("uncertain", component, "coverage", component, a["status"], b["status"],
++                  "Component not completed on both scans, origin differs, or discovery coverage is unknown/different; no absence or fix inferred.")
++        return a, b, okay
++
++    a, b, okay = compatible("network")
++    before = {(o.get("host"), o.get("protocol"), o.get("port")): o for o in a.get("observations", [])}
++    after = {(o.get("host"), o.get("protocol"), o.get("port")): o for o in b.get("observations", [])}
++    for key in sorted(before.keys() | after.keys(), key=str):
++        left, right = before.get(key), after.get(key)
++        lo, ro = left and left.get("state") == "open", right and right.get("state") == "open"
++        if lo and not ro:
++            event("removed" if okay and _closed(b, key) else "uncertain", "network", "open_port", key, left, right,
++                  "No longer observed open; closure requires completed explicit closed evidence or unambiguous closed coverage.")
++        elif ro and not lo:
++            event("added" if okay and _closed(a, key) else "uncertain", "network", "open_port", key, left, right,
++                  "New open observation; baseline must have assessed this port as closed to establish a change.")
++        elif lo and ro:
++            for field in ("service", "product", "version"):
++                lv, rv = left.get(field), right.get(field)
++                if lv != rv:
++                    event("changed" if okay and lv and rv else "uncertain", "network", field, key, lv, rv,
++                          "Scanner-reported service identity; unknown values are not evidence of removal or upgrade.")
++    a, b, okay = compatible("http")
++    for header in sorted(SECURITY_HEADERS):
++        lv, rv = a.get("headers", {}).get(header), b.get("headers", {}).get(header)
++        if lv != rv:
++            bucket = "added" if lv is None else "removed" if rv is None else "changed"
++            event(bucket if okay else "uncertain", "http", "security_header", header, lv, rv, "Saved response-header values; application impact requires review.")
++    a, b, okay = compatible("tls")
++    for field in ("verification", "protocol", "cipher", "subject", "issuer", "expires", "not_before", "serial_number", "subject_alt_names", "certificate_sha256"):
++        lv, rv = a.get("details", {}).get(field), b.get("details", {}).get(field)
++        if lv != rv:
++            event("changed" if okay and lv is not None and rv is not None else "uncertain", "tls", "tls_metadata", field, lv, rv,
++                  "Observed TLS connection/certificate difference; failed verification cannot establish remediation.")
++    a, b, okay = compatible("paths")
++    before = {o["path"]: o for o in a.get("observations", [])}
++    after = {o["path"]: o for o in b.get("observations", [])}
++    for key in sorted(before.keys() | after.keys()):
++        left, right = before.get(key), after.get(key)
++        if left is None or right is None:
++            event(("added" if left is None else "removed") if okay else "uncertain", "paths", "path_observation", key, left, right,
++                  "Path observed/not observed under matching limited discovery coverage; sensitivity and vulnerability are not established.")
++        elif left.get("status") != right.get("status"):
++            event("changed" if okay else "uncertain", "paths", "path_status", key, left, right, "Saved HTTP status changed for this path.")
++    result["summary"] = {key: len(result[key]) for key in ("added", "removed", "changed", "uncertain")}
++    return result
+diff --git a/backend/main.py b/backend/main.py
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -4,12 +4,13 @@
+ from fastapi.templating import Jinja2Templates
+ from fastapi.staticfiles import StaticFiles
+ from typing import Optional, List
+-from uuid import uuid4
++from uuid import uuid4, UUID
+ import subprocess
+ import xmltodict
+ import ipaddress
+ import json
+ import hashlib
++from xml.parsers.expat import ExpatError
+ from pathlib import Path
+ from pydantic import BaseModel, Field
+ from backend.scanner.scan_policy import (
+@@ -18,6 +19,8 @@
+ )
+ from backend.scanner.web_assessment import assess_web_url, validate_web_url
+ from backend.scanner.web_rules import build_web_findings
++from backend.snapshots import normalize_scan, read_json, atomic_json, artifact_manifest, validate_snapshot
++from backend.delta_engine import compare_snapshots, IncompatibleScans
+ from backend.scanner.path_discovery import execute_discovery, prepare_wordlist, parse_paths, DiscoveryStopped
+ from backend.scanner.pcvp_scoring import pcvp_score_for_service
+ from backend.scanner.network_findings import normalized_observation, normalize_nvd_candidates, build_network_findings
+@@ -64,6 +67,7 @@
+     profile: str = "standard"
+     authorized: bool = False
+     path_discovery: bool = False
++    network_scan: bool = True
+ 
+ class ScanStatus(BaseModel):
+     scan_id: str
+@@ -84,6 +88,7 @@
+     nmap_status: Optional[str] = None
+     nmap_exit_code: Optional[int] = None
+     path_discovery: bool = False
++    network_scan: bool = True
+     web_url: Optional[str] = None
+     web_status: Optional[str] = None
+ 
+@@ -91,6 +96,8 @@
+ class WebScanRequest(BaseModel):
+     url: str
+     description: Optional[str] = None
++    authorized: bool = False
++    path_discovery: bool = False
+ 
+ 
+ class WebScanStatus(BaseModel):
+@@ -328,18 +335,22 @@
+ def run_scan_job(scan_id: str, web_url: Optional[str] = None) -> None:
+     try:
+         status = scan_status_store[scan_id]
+-        if "/" in status.target:
++        if not status.network_scan:
++            status.nmap_status = "skipped"
++            status.status = "nmap_done"
++        elif "/" in status.target:
+             run_cidr_scan(scan_id, status.target, status.ports)
+         else:
+             run_nmap_scan(scan_id, status.target, status.ports)
+         if status.nmap_status == "failed" and web_url:
+             status.gobuster_status = "skipped"
++            status.web_status = "skipped"
+             _save_scan_status_store()
+-        if status.nmap_status == "completed" and web_url:
++        if status.nmap_status in {"completed", "skipped"} and web_url:
+             run_gobuster_scan(scan_id, web_url)
+             status.status = "failed" if status.web_status == "failed" else "completed"
+-            status.message = ("Network completed; web assessment failed." if status.status == "failed" else
+-                              f"Network and HTTP/TLS assessments completed; optional path discovery: {status.gobuster_status}.")
++            status.message = (("Network completed; web assessment failed." if status.network_scan else "Web assessment failed.") if status.status == "failed" else
++                              f"{'Network and HTTP/TLS assessments' if status.network_scan else 'HTTP/TLS assessment'} completed; optional path discovery: {status.gobuster_status}.")
+             status.completed_at = _utc_now()
+             _save_scan_status_store()
+     except Exception as exc:
+@@ -350,9 +361,21 @@
+             status.completed_at = _utc_now()
+             _save_scan_status_store()
+     finally:
+-        with STATUS_LOCK:
+-            DISCOVERY_STOPS.pop(scan_id, None)
+-        SCAN_SLOTS.release()
++        try:
++            if scan_id in scan_status_store:
++                persist_snapshot(scan_id)
++        except Exception as exc:
++            status = scan_status_store[scan_id]
++            status.status = "failed"
++            status.message = f"Cannot persist finalized snapshot: {exc}"
++            try:
++                _save_scan_status_store()
++            except OSError:
++                pass
++        finally:
++            with STATUS_LOCK:
++                DISCOVERY_STOPS.pop(scan_id, None)
++            SCAN_SLOTS.release()
+ 
+ 
+ @app.post("/scan", response_model=ScanStatus)
+@@ -365,7 +388,10 @@
+         plan = validate_request(request.target, request.ports, request.profile)
+         if request.path_discovery and request.profile != "web":
+             raise ValueError("Optional path discovery requires the Web profile")
+-        resolve_executable("RISKLENS_NMAP_PATH", "nmap")
++        if not request.network_scan and request.profile != "web":
++            raise ValueError("Only Web assessments can omit the network scan")
++        if request.network_scan:
++            resolve_executable("RISKLENS_NMAP_PATH", "nmap")
+         if plan["web_url"]:
+             validate_web_url(plan["web_url"], plan["scope"])
+     except ScopeError as exc:
+@@ -384,9 +410,9 @@
+             exposure=exposure, exposure_effective=(infer_exposure_from_target(plan["targets"][0]) if exposure == "auto" else exposure),
+             gobuster_status="pending" if request.path_discovery else "skipped", profile=request.profile,
+             description=request.description, created_at=_utc_now(), ports=plan["ports"],
+-            authorized_targets=plan["targets"], approved_scope=plan["scope"], nmap_status="pending",
++            authorized_targets=plan["targets"], approved_scope=plan["scope"], nmap_status="pending" if request.network_scan else "skipped",
+             authorized=True,
+-            path_discovery=request.path_discovery, web_url=plan["web_url"],
++            path_discovery=request.path_discovery, network_scan=request.network_scan, web_url=plan["web_url"],
+             web_status="pending" if plan["web_url"] else "skipped",
+         )
+         with STATUS_LOCK:
+@@ -444,7 +470,24 @@
+     else:
+         hosts = raw_hosts
+ 
+-    parsed = {"hosts": [], "observations": []}
++    scaninfos = nmaprun.get("scaninfo", [])
++    scaninfos = [scaninfos] if isinstance(scaninfos, dict) else scaninfos
++    scanned_ports = {}
++    for info in scaninfos:
++        ports = set()
++        for item in info.get("@services", "").split(","):
++            if not item:
++                continue
++            bounds = item.split("-")
++            low, high = int(bounds[0]), int(bounds[-1])
++            if not 1 <= low <= high <= 65535:
++                raise ValueError("Invalid XML port coverage")
++            ports.update(range(low, high + 1))
++        scanned_ports[info.get("@protocol", "tcp")] = sorted(ports)
++    parsed = {"hosts": [], "observations": [], "coverage": {
++        "scanned_ports": scanned_ports,
++        "run_completed": ((nmaprun.get("runstats") or {}).get("finished") or {}).get("@exit") == "success"}}
++
+ 
+     for host in hosts:
+         addresses = host.get("address", [])
+@@ -547,8 +590,13 @@
+             )
+             parsed["observations"].append(normalized_observation(ip, services[-1]))
+ 
++        omitted = ports_block.get("extraports", [])
++        omitted = [omitted] if isinstance(omitted, dict) else omitted
+         parsed["hosts"].append({
+-            "ip": ip,
++            "ip": ip, "state": (host.get("status") or {}).get("@state", "unknown"),
++            "timed_out": host.get("@timedout") == "true",
++            "omitted_port_states": sorted({p.get("@state", "unknown") for p in omitted}),
++            "omitted_port_count": sum(int(p.get("@count", "0")) for p in omitted),
+             "hostnames": hostnames,
+             "reverse_dns": reverse_dns,
+             "mac": mac_address,
+@@ -576,30 +624,12 @@
+ 
+ @app.get("/scan/{scan_id}/nvd")
+ def get_scan_with_nvd(scan_id: str):
+-    scan_status = scan_status_store.get(scan_id)
+-    if not scan_status:
+-        raise HTTPException(status_code=404, detail="Scan not found")
+-    if scan_status.nmap_status != "completed" and scan_status.status not in ("completed", "nmap_done"):
+-        raise HTTPException(status_code=400, detail=f"Scan not completed ({scan_status.status}): {scan_status.message}")
+-
+-    xml_path = SCANS_DIR / f"{scan_id}.xml"
+-    if not xml_path.exists():
+-        raise HTTPException(status_code=404, detail="Scan output not found yet")
+-
+-    try:
+-        parsed = parse_nmap_xml(xml_path)
+-    except Exception as e:
+-        raise HTTPException(status_code=500, detail=f"Failed to parse scan XML: {e}")
+-
+-    exposure_effective = (
+-        scan_status.exposure_effective
+-        if scan_status.exposure_effective
+-        else infer_exposure_from_target(scan_status.target)
+-    )
+-
+-    annotate_saved_services(parsed, exposure_effective)
+-
+-    return {"scan_id": scan_id, "exposure": scan_status.exposure, "profile": scan_status.profile, "data": parsed}
++    snapshot = load_snapshot(scan_id)
++    return {"scan_id": scan_id, "exposure": snapshot["metadata"].get("exposure"),
++            "profile": snapshot["metadata"].get("profile"),
++            "component_status": snapshot["components"]["network"]["status"],
++            "data": snapshot["components"]["network"].get("parsed", {"hosts": []})}
++
+ 
+ 
+ def build_findings(parsed: dict, web_assessment: Optional[dict] = None) -> list[dict]:
+@@ -655,27 +685,36 @@
+ 
+ @app.get("/scan/{scan_id}/findings")
+ def get_findings(scan_id: str):
+-    if not (SCANS_DIR / f"{scan_id}.xml").exists():
+-        raise HTTPException(status_code=404, detail="Scan output not found yet")
+-    parsed, web_audit = enrich_scan_data(scan_id)
+-    findings = build_findings(parsed, web_audit)
+-    counts = {level: sum(1 for f in findings if f["severity"] == level) for level in ("critical", "high", "medium", "low", "info")}
++    snapshot = load_snapshot(scan_id)
++    findings = snapshot["findings"]
++    counts = {level: sum(1 for finding in findings if finding["severity"] == level)
++              for level in ("critical", "high", "medium", "low", "info")}
+     return {"scan_id": scan_id, "summary": counts, "findings": findings,
+-            "network_observations": parsed["observations"],
+-            "candidate_vulnerabilities": parsed["candidate_vulnerabilities"]}
++            "network_observations": snapshot["components"]["network"]["observations"],
++            "candidate_vulnerabilities": [item for item in findings if item.get("category") == "candidate_vulnerability"]}
++
+ 
+ 
+ @app.get("/scan/{scan_id}/findings.csv")
+-def download_findings_csv(scan_id: str):
++def download_findings_csv(scan_id: str, baseline: Optional[str] = None):
++    snapshot = load_snapshot(scan_id)
+     data = get_findings(scan_id)
++    differences = get_comparison(scan_id, baseline) if baseline else None
+     output = io.StringIO()
+     writer = csv.DictWriter(output, fieldnames=["id", "title", "severity", "confidence", "asset", "source", "cvss", "evidence", "remediation",
+-                                              "domain", "category", "rule_id", "reason", "verification_status", "reported_cvss", "original_evidence", "retest"], extrasaction="ignore")
++                                              "domain", "category", "rule_id", "reason", "verification_status", "reported_cvss", "original_evidence", "retest", "scan_id", "target", "timestamp", "record_type", "before", "after"], extrasaction="ignore")
+     writer.writeheader()
+     for finding in data["findings"]:
+-        row = dict(finding)
++        row = {**finding, "scan_id": scan_id, "target": snapshot["target"], "timestamp": snapshot["timestamp"], "record_type": "finding"}
+         row["original_evidence"] = json.dumps(row.get("original_evidence", {}), sort_keys=True)
+         writer.writerow(row)
++    if differences:
++        for bucket in ("added", "removed", "changed", "uncertain"):
++            for item in differences[bucket]:
++                writer.writerow({"record_type": "difference", "category": bucket, "domain": item["component"],
++                                 "title": item["kind"], "asset": item["key"], "evidence": item["reason"],
++                                 "before": json.dumps(item["before"]), "after": json.dumps(item["after"]),
++                                 "scan_id": scan_id, "target": snapshot["target"], "timestamp": snapshot["timestamp"]})
+     return Response(
+         content=output.getvalue(),
+         media_type="text/csv",
+@@ -711,7 +750,7 @@
+     return {"scan_id": scan_id, "exposure": scan_status.exposure, "graph": graph}
+ 
+ def _validate_web_job(status: ScanStatus, url: str) -> None:
+-    if not status.authorized or status.nmap_status != "completed":
++    if not status.authorized or not (status.nmap_status == "completed" or (not status.network_scan and status.nmap_status == "skipped")):
+         raise ScopeError("Web assessment requires a completed authorized network scan")
+     parsed, host, port = validate_web_url(url, status.approved_scope)
+     if host not in status.authorized_targets:
+@@ -848,7 +887,7 @@
+ 
+ @app.get("/webscan/{scan_id}/findings")
+ def get_web_findings(scan_id: str):
+-    return {"scan_id": scan_id, "findings": build_web_findings(get_web_security_assessment(scan_id))}
++    return {"scan_id": scan_id, "findings": [item for item in load_snapshot(scan_id)["findings"] if item.get("domain") == "web"]}
+ 
+ 
+ @app.get("/scan/{scan_id}/alive-hosts")
+@@ -891,38 +930,95 @@
+     return {"scan_id": scan_id, "hosts": hosts}
+ 
+ @app.get("/scan/{scan_id}/report.pdf")
+-def download_report(scan_id: str):
+-    xml_path = SCANS_DIR / f"{scan_id}.xml"
+-    if not xml_path.exists():
+-        raise HTTPException(status_code=404, detail="Scan output not found yet")
+-
+-    parsed = parse_nmap_xml(xml_path)
+-
+-    scan_status = scan_status_store.get(scan_id)
+-
+-    exposure_effective = (
+-        scan_status.exposure_effective
+-        if scan_status and scan_status.exposure_effective
+-        else infer_exposure_from_target(scan_status.target) if scan_status else "external"
+-    )
+-
+-    annotate_saved_services(parsed, exposure_effective)
+-
+-    attack_graph = build_attack_graph(parsed)
+-    audit_path = SCANS_DIR / f"web_audit_{scan_id}.json"
+-    audit = json.loads(audit_path.read_text(encoding="utf-8")) if audit_path.exists() else None
+-    findings = build_findings(parsed, audit)
+-
+-    pdf_bytes = build_pdf_report(
+-        scan_id=scan_id,
+-        exposure=exposure_effective,
+-        parsed=parsed,
+-        attack_graph=attack_graph,
+-        findings=findings,
+-    )
+-
+-    return StreamingResponse(
+-        BytesIO(pdf_bytes),
+-        media_type="application/pdf",
+-        headers={"Content-Disposition": f'attachment; filename="pcvp_report_{scan_id}.pdf"'},
+-    )
++def download_report(scan_id: str, baseline: Optional[str] = None):
++    snapshot = load_snapshot(scan_id)
++    differences = get_comparison(scan_id, baseline) if baseline else None
++    pdf_bytes = build_pdf_report(scan_id=scan_id,
++        exposure=snapshot["metadata"].get("exposure_effective") or "unknown",
++        parsed=snapshot["components"]["network"].get("parsed", {"hosts": []}),
++        findings=snapshot["findings"], snapshot=snapshot, differences=differences)
++    return StreamingResponse(BytesIO(pdf_bytes), media_type="application/pdf",
++        headers={"Content-Disposition": f'attachment; filename="risklens_{scan_id}.pdf"'})
++
++
++def checked_scan_id(scan_id: str) -> str:
++    try:
++        canonical = str(UUID(scan_id))
++        if canonical != scan_id.lower():
++            raise ValueError()
++        return canonical
++    except (ValueError, AttributeError, TypeError):
++        raise HTTPException(status_code=400, detail="Scan ID must be a canonical UUID")
++
++
++def normalize_saved_scan(scan_id: str) -> dict:
++    status = scan_status_store.get(scan_id)
++    if status is None:
++        raise HTTPException(status_code=404, detail="Saved scan metadata not found")
++    xml = SCANS_DIR / f"{scan_id}.xml"
++    partial = SCANS_DIR / f"{scan_id}.xml.partial"
++    parsed = {"hosts": [], "observations": []}
++    if xml.exists():
++        parsed = parse_nmap_xml(xml)
++    elif partial.exists():
++        try:
++            parsed = parse_nmap_xml(partial)
++        except (ValueError, ExpatError):
++            pass
++    annotate_saved_services(parsed, status.exposure_effective or "unknown")
++    audit = read_json(SCANS_DIR / f"web_audit_{scan_id}.json")
++    path_status_file = SCANS_DIR / f"gobuster_{scan_id}.status"
++    try:
++        path_record = read_json(path_status_file)
++    except json.JSONDecodeError:
++        path_record = {"summary": path_status_file.read_text(encoding="utf-8")}
++    path_output = SCANS_DIR / f"gobuster_{scan_id}.txt"
++    words_file = SCANS_DIR / f"gobuster_{scan_id}.words.txt"
++    words = words_file.read_text(encoding="utf-8").splitlines() if words_file.exists() else None
++    names = [f"{scan_id}.xml", f"{scan_id}.xml.partial", f"nmap_{scan_id}.json", f"web_audit_{scan_id}.json",
++             f"gobuster_{scan_id}.txt", f"gobuster_{scan_id}.status", f"gobuster_{scan_id}.words.txt"]
++    snapshot = normalize_scan(status.model_dump(), parsed, audit,
++        parse_gobuster_output(path_output) if path_output.exists() else None,
++        path_record, read_json(SCANS_DIR / f"nmap_{scan_id}.json"),
++        artifact_manifest(SCANS_DIR, names), words)
++    snapshot["findings"] = build_findings(parsed, audit)
++    return snapshot
++
++
++def persist_snapshot(scan_id: str):
++    snapshot = normalize_saved_scan(scan_id)
++    atomic_json(SCANS_DIR / f"snapshot_{scan_id}.json", snapshot)
++    return snapshot
++
++
++def load_snapshot(scan_id: str) -> dict:
++    scan_id = checked_scan_id(scan_id)
++    try:
++        snapshot = read_json(SCANS_DIR / f"snapshot_{scan_id}.json")
++        if snapshot is None:
++            return normalize_saved_scan(scan_id)  # legacy conversion in memory; GET never writes
++        return validate_snapshot(snapshot, scan_id)
++    except (OSError, ValueError, TypeError, ExpatError) as exc:
++        raise HTTPException(status_code=422, detail=f"Cannot read saved evidence: {exc}")
++
++
++@app.post("/webscan", response_model=ScanStatus)
++def start_independent_web_scan(request: WebScanRequest, background_tasks: BackgroundTasks):
++    return start_scan(ScanRequest(target=request.url, description=request.description, profile="web",
++        authorized=request.authorized, path_discovery=request.path_discovery, network_scan=False), background_tasks)
++
++
++@app.get("/scans/{scan_id}/snapshot")
++def get_snapshot(scan_id: str):
++    return load_snapshot(scan_id)
++
++
++@app.get("/scans/{new_id}/compare/{old_id}")
++def get_comparison(new_id: str, old_id: str):
++    new, old = load_snapshot(new_id), load_snapshot(old_id)
++    if new["metadata"].get("status") in {"pending", "running", "nmap_done"} or old["metadata"].get("status") in {"pending", "running", "nmap_done"}:
++        raise HTTPException(status_code=409, detail="Wait for both scan jobs to finish; no negative inference from active scans")
++    try:
++        return compare_snapshots(old, new)
++    except IncompatibleScans as exc:
++        raise HTTPException(status_code=409, detail=str(exc))
+diff --git a/backend/report_generator.py b/backend/report_generator.py
+--- a/backend/report_generator.py
++++ b/backend/report_generator.py
+@@ -1,225 +1,70 @@
+-from __future__ import annotations
+-from typing import Any, Dict, List
++"""Local PDF export from the same saved snapshot/findings used by the UI."""
+ from io import BytesIO
+-from datetime import datetime, timezone
++import json
++from xml.sax.saxutils import escape
+ from reportlab.lib.pagesizes import A4
+-from reportlab.lib.units import cm
+-from reportlab.lib import colors
+ from reportlab.lib.styles import getSampleStyleSheet
+-from reportlab.platypus import (
+-    SimpleDocTemplate,
+-    Paragraph,
+-    Spacer,
+-    Table,
+-    TableStyle,
+-    ListFlowable,
+-    ListItem,
+-)
++from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+ 
+-def _safe(v: Any) -> str:
+-    if v is None:
+-        return ""
+-    return str(v)
+ 
+-def _page_footer(canvas, doc):
+-    canvas.saveState()
+-    canvas.setFont("Helvetica", 8)
+-    canvas.setFillColor(colors.grey)
+-    canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc.page}")
+-    canvas.restoreState()
++def _text(value):
++    if isinstance(value, (dict, list)):
++        value = json.dumps(value, ensure_ascii=True, sort_keys=True)
++    return escape(str(value if value is not None else "Not recorded"))
+ 
+-def build_pdf_report(
+-    scan_id: str,
+-    exposure: str,
+-    parsed: Dict[str, Any],
+-    attack_graph: Dict[str, Any] | None = None,
+-    findings: List[Dict[str, Any]] | None = None,
+-) -> bytes:
+-    """
+-    Returns PDF bytes.
+-    parsed should be the same structure you return in /scan/{scan_id}/nvd:
+-      {"hosts":[{"ip":..., "services":[...]}]}
+-    attack_graph: output of build_attack_graph()
+-    """
+-    buf = BytesIO()
+-    doc = SimpleDocTemplate(
+-        buf,
+-        pagesize=A4,
+-        leftMargin=2 * cm,
+-        rightMargin=2 * cm,
+-        topMargin=2 * cm,
+-        bottomMargin=2 * cm,
+-    )
+ 
++def build_pdf_report(scan_id, exposure, parsed, attack_graph=None, findings=None, snapshot=None, differences=None):
++    buffer = BytesIO()
++    doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=42, rightMargin=42,
++                            topMargin=42, bottomMargin=42, pageCompression=0)
+     styles = getSampleStyleSheet()
+-    h1 = styles["Heading1"]
+-    h2 = styles["Heading2"]
+-    h3 = styles["Heading3"]
+-    body = styles["BodyText"]
++    styles["BodyText"].wordWrap = "CJK"
++    story = [Paragraph("RiskLens Security Assessment Report", styles["Title"])]
+ 
+-    story = []
++    def line(label, value):
++        story.append(Paragraph(f"<b>{_text(label)}:</b> {_text(value)}", styles["BodyText"]))
+ 
+-    # Title
+-    story.append(Paragraph("RiskLens Security Assessment Report", h1))
+-    story.append(Spacer(1, 0.3 * cm))
+-    story.append(Paragraph(f"<b>Scan ID:</b> {scan_id}", body))
+-    story.append(Paragraph(f"<b>Exposure:</b> {exposure}", body))
+-    story.append(Paragraph(f"<b>Generated:</b> {datetime.now(timezone.utc).isoformat()}", body))
+-    story.append(Spacer(1, 0.6 * cm))
++    def heading(value):
++        story.append(Spacer(1, 10))
++        story.append(Paragraph(_text(value), styles["Heading2"]))
+ 
+-    # Flatten services
+-    hosts = parsed.get("hosts", []) or []
+-    services_flat: List[Dict[str, Any]] = []
+-    for h in hosts:
+-        for s in (h.get("services") or []):
+-            services_flat.append({**s, "ip": h.get("ip")})
+-
+-    critical = sum(1 for s in services_flat if (s.get("pcvp_level") == "critical"))
+-    high = sum(1 for s in services_flat if (s.get("pcvp_level") == "high"))
+-
+-    # Executive summary
+-    story.append(Paragraph("Executive Summary", h2))
+-    summary_table = Table(
+-        [
+-            ["Hosts discovered", str(len(hosts))],
+-            ["Services detected", str(len(services_flat))],
+-            ["Critical / High review levels (not flaws)", f"{critical} / {high}"],
+-            ["Credential testing", "Not performed"],
+-        ],
+-        colWidths=[8 * cm, 6 * cm],
+-    )
+-    summary_table.setStyle(
+-        TableStyle(
+-            [
+-                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+-                ("FONT", (0, 0), (-1, -1), "Helvetica", 9),
+-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+-            ]
+-        )
+-    )
+-    story.append(summary_table)
+-    story.append(Spacer(1, 0.7 * cm))
+-
+-    # Attack Graph Summary + Chains
+-    story.append(Paragraph("Attack Graph Summary", h2))
+-    graph = attack_graph or {}
+-    nodes = graph.get("nodes", []) or []
+-    edges = graph.get("edges", []) or []
+-
+-    host_nodes = [n for n in nodes if n.get("type") == "host"]
+-    svc_nodes = [n for n in nodes if n.get("type") == "service"]
+-    cve_nodes = [n for n in nodes if n.get("type") == "cve"]
+-    vuln_edges = [e for e in edges if e.get("relation") == "has_vulnerability"]
+-    chain_edges = [e for e in edges if e.get("relation") == "possible_chain"]
+-
+-    ag_table = Table(
+-        [
+-            ["Hosts", str(len(host_nodes))],
+-            ["Services", str(len(svc_nodes))],
+-            ["CVEs linked", str(len(cve_nodes))],
+-            ["Vulnerability edges", str(len(vuln_edges))],
+-            ["Possible attack chains", str(len(chain_edges))],
+-        ],
+-        colWidths=[8 * cm, 6 * cm],
+-    )
+-    ag_table.setStyle(
+-        TableStyle(
+-            [
+-                ("GRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
+-                ("FONT", (0, 0), (-1, -1), "Helvetica", 9),
+-            ]
+-        )
+-    )
+-    story.append(ag_table)
+-    story.append(Spacer(1, 0.4 * cm))
+-
+-    node_map = {n.get("id"): n for n in nodes}
+-    if chain_edges:
+-        story.append(Paragraph("Attack Chain Candidates (sample)", h3))
+-        chain_items = []
+-        for e in chain_edges[:15]:
+-            a = node_map.get(e.get("from"), {})
+-            b = node_map.get(e.get("to"), {})
+-            a_label = f"{_safe(a.get('ip'))}:{_safe(a.get('port'))}/{_safe(a.get('protocol'))}"
+-            b_label = f"{_safe(b.get('ip'))}:{_safe(b.get('port'))}/{_safe(b.get('protocol'))}"
+-            chain_items.append(ListItem(Paragraph(f"{a_label} → {b_label}", body)))
+-        story.append(ListFlowable(chain_items, bulletType="bullet"))
+-    else:
+-        story.append(Paragraph("No attack chains detected.", body))
+-
+-    story.append(Spacer(1, 0.7 * cm))
+-
+-    # Findings table
+-    story.append(Paragraph("Observed Services and Review Priority", h2))
+-    services_flat.sort(key=lambda s: (s.get("pcvp_score") or 0), reverse=True)
+-
+-    data = [
+-        ["Host", "Port/Proto", "Service", "Product", "Review priority", "Credential tests", "CVE candidates"]
+-    ]
+-    for s in services_flat[:50]:
+-        wc = s.get("weak_creds") or {}
+-        weak_text = (
+-            f"{_safe(wc.get('protocol'))} {_safe(wc.get('username'))}:{_safe(wc.get('password'))}"
+-            if wc.get("found")
+-            else "Not tested"
+-        )
+-
+-        nvd = s.get("nvd") or {}
+-        cves = nvd.get("cves") or nvd.get("CVEs") or []
+-        if isinstance(cves, list) and cves:
+-            cve_text = ", ".join([_safe(cv.get("cve_id") or cv.get("id")) for cv in cves[:3]])
+-        else:
+-            cve_text = "Not queried"
+-
+-        data.append(
+-            [
+-                _safe(s.get("ip")),
+-                f"{_safe(s.get('port'))}/{_safe(s.get('protocol'))}",
+-                _safe(s.get("service")),
+-                (_safe(s.get("product")) + " " + _safe(s.get("version"))).strip(),
+-                f"{_safe(s.get('pcvp_level'))} ({_safe(s.get('pcvp_score'))})",
+-                weak_text,
+-                cve_text,
+-            ]
+-        )
+-
+-    table = Table(
+-        data,
+-        repeatRows=1,
+-        colWidths=[3 * cm, 2.5 * cm, 2.5 * cm, 4 * cm, 3 * cm, 4 * cm, 4 * cm],
+-    )
+-    table.setStyle(
+-        TableStyle(
+-            [
+-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+-                ("GRID", (0, 0), (-1, -1), 0.3, colors.lightgrey),
+-                ("FONT", (0, 0), (-1, -1), "Helvetica", 8),
+-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+-            ]
+-        )
+-    )
+-    story.append(table)
+-    if findings:
+-        story.append(Spacer(1, 0.7 * cm))
+-        story.append(Paragraph("Observations and Unverified Candidates", h2))
+-        finding_data = [["Severity", "Finding", "Asset", "Source"]]
+-        for finding in findings[:40]:
+-            finding_data.append([
+-                _safe(finding.get("severity")),
+-                _safe(finding.get("title")),
+-                _safe(finding.get("asset")),
+-                _safe(finding.get("source")),
+-            ])
+-        findings_table = Table(finding_data, repeatRows=1, colWidths=[2.2 * cm, 7 * cm, 4 * cm, 3 * cm])
+-        findings_table.setStyle(TableStyle([
+-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+-            ("GRID", (0, 0), (-1, -1), 0.3, colors.lightgrey),
+-            ("FONT", (0, 0), (-1, -1), "Helvetica", 8),
+-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+-        ]))
+-        story.append(findings_table)
+-
+-    doc.build(story, onFirstPage=_page_footer, onLaterPages=_page_footer)
+-    return buf.getvalue()
++    line("Scan ID", scan_id)
++    line("Exposure", exposure)
++    if snapshot:
++        for label, value in (("Target", snapshot.get("target")), ("Assessment timestamp", snapshot.get("timestamp")),
++                             ("Snapshot status", snapshot.get("status"))):
++            line(label, value)
++        heading("Component coverage")
++        for name, component in snapshot["components"].items():
++            line(name, component["status"] + ": " + component.get("reason", ""))
++    heading("Interpretation")
++    line("Evidence limits", "Open ports and paths are observations. Keyword CVE matches are unverified candidates; advisory severity does not prove applicability. Missing coverage never establishes a fix. Credential testing was not performed.")
++    heading("Network observations")
++    hosts = parsed.get("hosts", [])
++    if not hosts:
++        line("Coverage", "No saved network observations; see component completion status.")
++    for host in hosts:
++        for service in host.get("services", []):
++            line(host.get("ip"), {key: service.get(key) for key in ("protocol", "port", "state", "service", "product", "version")})
++    findings = findings if findings is not None else (snapshot or {}).get("findings", [])
++    for domain, label in (("network", "Network findings and unverified candidates"), ("web", "Web configuration findings")):
++        heading(label)
++        entries = [item for item in findings if item.get("domain", "network") == domain]
++        if not entries:
++            line("Findings", "No saved rule findings for this component. This is not proof of security.")
++        for finding in entries:
++            story.append(Paragraph(_text(finding.get("id", "")) + " - " + _text(finding.get("title", "")), styles["Heading3"]))
++            for field in ("severity", "confidence", "confidence_scope", "asset", "verification_status", "evidence", "remediation", "retest"):
++                if field in finding:
++                    line(field, finding[field])
++    if differences:
++        heading("Exposure changes from saved baseline " + differences["old_id"])
++        line("Summary", differences["summary"])
++        for bucket in ("added", "removed", "changed", "uncertain"):
++            for item in differences[bucket]:
++                line(bucket + " / " + item["component"] + " / " + item["kind"], item["key"])
++                line("Before", item["before"])
++                line("After", item["after"])
++                line("Reason", item["reason"])
++    doc.build(story)
++    return buffer.getvalue()
+diff --git a/backend/scanner/path_discovery.py b/backend/scanner/path_discovery.py
+--- a/backend/scanner/path_discovery.py
++++ b/backend/scanner/path_discovery.py
+@@ -59,6 +59,15 @@
+                 diagnostic.seek(max(0, output.with_suffix(".stderr.log").stat().st_size - 2000))
+                 detail = diagnostic.read(2000).decode("utf-8", errors="replace")
+             raise RuntimeError(f"Gobuster exited with code {code}: {detail or 'No diagnostic output'}")
++        # Some versions log per-request failures but still exit zero. Such a run
++        # cannot establish negative path coverage for later comparisons.
++        for suffix in (".stderr.log", ".stdout.log"):
++            diagnostic_path = output.with_suffix(suffix)
++            with diagnostic_path.open("rb") as diagnostic:
++                diagnostic.seek(max(0, diagnostic_path.stat().st_size - 4000))
++                detail = diagnostic.read(4000).decode("utf-8", errors="replace").strip()
++            if detail and (suffix == ".stderr.log" or "[ERROR]" in detail):
++                raise RuntimeError(f"Gobuster diagnostics indicate uncertain coverage: {detail}")
+         return command
+     finally:
+         # Popen has no shell/child launcher; kill and reap the actual job on every early exit.
+diff --git a/backend/scanner/web_assessment.py b/backend/scanner/web_assessment.py
+--- a/backend/scanner/web_assessment.py
++++ b/backend/scanner/web_assessment.py
+@@ -114,6 +114,7 @@
+     result = {"url": url, "http": {}, "tls": {}, "technologies": [], "checks": [],
+               "status": "failed", "redirects": []}
+     conn = None
++    response = None
+     phase = "validation"
+     try:
+         parsed, host, port = validate_web_url(url, scope)
+@@ -155,6 +156,8 @@
+         sample = bytearray()
+         if not 300 <= response.status < 400:
+             while len(sample) < BODY_LIMIT:
++                if response.isclosed() is True:
++                    break
+                 remaining = deadline - time.monotonic()
+                 if remaining <= 0:
+                     raise TimeoutError("Assessment time budget exceeded")
+@@ -199,6 +202,8 @@
+             category = "assessment_error"
+         result.update(status="partial" if result["http"] else "failed", error_category=category, error=str(exc))
+     finally:
++        if response is not None:
++            response.close()
+         if conn is not None:
+             conn.close()
+     return result
+diff --git a/backend/snapshots.py b/backend/snapshots.py
+new file mode 100644
+--- /dev/null
++++ b/backend/snapshots.py
+@@ -0,0 +1,164 @@
++"""Offline normalization of saved evidence. No network, scanning or process calls."""
++
++from copy import deepcopy
++import hashlib
++import ipaddress
++import json
++import re
++from urllib.parse import urlsplit
++
++SCHEMA_VERSION = 1
++TERMINAL = {"completed", "failed", "partial", "cancelled", "timed_out", "skipped"}
++
++
++def validate_snapshot(snapshot, scan_id):
++    if snapshot.get("schema_version") != SCHEMA_VERSION or snapshot.get("scan_id") != scan_id:
++        raise ValueError("Unsupported snapshot version or mismatched scan ID")
++    if not all(isinstance(snapshot.get(key), dict) for key in ("metadata", "identity", "components")):
++        raise ValueError("Snapshot metadata/identity is missing")
++    if not isinstance(snapshot["identity"].get("targets"), list) or any(not isinstance(target, str) for target in snapshot["identity"]["targets"]):
++        raise ValueError("Invalid snapshot target identities")
++    if not isinstance(snapshot.get("findings"), list) or any(
++            not isinstance(item, dict) or item.get("severity") not in {"critical", "high", "medium", "low", "info"}
++            for item in snapshot["findings"]):
++        raise ValueError("Invalid persisted findings")
++    for name in ("network", "http", "tls", "paths"):
++        component = snapshot.get("components", {}).get(name)
++        if not isinstance(component, dict) or component.get("status") not in {"completed", "partial", "failed", "not_run"}:
++            raise ValueError(f"Invalid {name} component coverage")
++    network, http, tls, paths = (snapshot["components"][name] for name in ("network", "http", "tls", "paths"))
++    if not all(isinstance(value, list) for value in (network.get("hosts"), network.get("observations"), paths.get("observations"))):
++        raise ValueError("Invalid observations")
++    if not all(isinstance(value, dict) for value in (network.get("parsed"), network.get("coverage"), http.get("headers"), http.get("response"), tls.get("details"), paths.get("coverage"))):
++        raise ValueError("Invalid component evidence")
++    if any(not isinstance(item, dict) or not isinstance(item.get("port"), int)
++           or not isinstance(item.get("protocol"), str) or not isinstance(item.get("host"), (str, type(None)))
++           for item in network["observations"]):
++        raise ValueError("Invalid port observation")
++    if any(not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in paths["observations"]):
++        raise ValueError("Invalid path observation")
++    return snapshot
++
++
++def origin(url):
++    if not url:
++        return None
++    value = urlsplit(url)
++    host = value.hostname.lower().rstrip(".") if value.hostname else ""
++    try:
++        host = str(ipaddress.ip_address(host))
++    except ValueError:
++        if not host or not re.fullmatch(r"[a-z0-9.-]+", host):
++            raise ValueError("Saved web host is invalid")
++    if value.scheme not in {"http", "https"} or value.username or value.password:
++        raise ValueError("Saved web origin is invalid")
++    return {"scheme": value.scheme, "host": host, "port": value.port or (443 if value.scheme == "https" else 80)}
++
++
++def target_key(value):
++    if not isinstance(value, str) or not value:
++        return None
++    try:
++        return str(ipaddress.ip_network(value, strict=True)) if "/" in value and "://" not in value else str(ipaddress.ip_address(value))
++    except ValueError:
++        return value.lower().rstrip(".")
++
++
++def read_json(path):
++    if not path.exists():
++        return None
++    if path.stat().st_size > 32 * 1024 * 1024:
++        raise ValueError(f"Saved artifact too large: {path.name}")
++    value = json.loads(path.read_text(encoding="utf-8"))
++    if not isinstance(value, dict):
++        raise ValueError(f"Expected an object in {path.name}")
++    return value
++
++
++def atomic_json(path, value):
++    temporary = path.with_suffix(path.suffix + ".tmp")
++    temporary.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
++    temporary.replace(path)
++
++
++def _component(status, evidence, reason):
++    return {"status": status, "reason": reason, **evidence}
++
++
++def normalize_scan(metadata, parsed=None, audit=None, paths=None, path_record=None, nmap_record=None, artifacts=None, words=None):
++    """Do not infer completion from a nonempty artifact or an overall success alone."""
++    meta = deepcopy(metadata)
++    parsed, audit = deepcopy(parsed or {"hosts": [], "observations": []}), deepcopy(audit or {})
++    path_record, nmap_record = path_record or {}, nmap_record or {}
++    raw_network = meta.get("nmap_status") or nmap_record.get("status")
++    has_network = bool(parsed.get("hosts")) or bool(parsed.get("coverage"))
++    if meta.get("network_scan") is False or raw_network in {"skipped", "not_run"}:
++        network_state = "not_run"
++    elif (raw_network == "completed" and has_network and parsed.get("coverage", {}).get("run_completed")
++          and not any(host.get("timed_out") for host in parsed.get("hosts", []))):
++        network_state = "completed"
++    elif raw_network in {"failed", "timed_out", "cancelled"}:
++        network_state = "partial" if has_network else "failed"
++    else:
++        network_state = "partial" if has_network else ("not_run" if raw_network is None else "failed")
++    http = audit.get("http") or {}
++    http_state = ("completed" if isinstance(http.get("status"), int) and 200 <= http["status"] < 400
++                  and isinstance(http.get("headers"), dict) and not audit.get("error") else
++                  "partial" if http.get("status") is not None else "failed" if audit else "not_run")
++    tls = audit.get("tls") or {}
++    web_origin = origin(meta.get("web_url") or audit.get("url"))
++    tls_state = ("completed" if tls.get("verification") == "verified" else
++                 "failed" if tls.get("verification") == "failed" or tls.get("error") else
++                 "partial" if tls.get("protocol") else "not_run")
++    raw_paths = path_record.get("status") or meta.get("gobuster_status")
++    if path_record.get("enabled") is False:
++        path_state = "not_run"
++    elif raw_paths == "completed" and paths is not None:
++        path_state = "completed"
++    elif raw_paths in {"failed", "timed_out", "cancelled"}:
++        path_state = "partial" if paths else "failed"
++    else:
++        path_state = "partial" if paths else "not_run"
++    requested = meta.get("ports")
++    coverage = deepcopy(parsed.get("coverage") or {})
++    coverage["requested_ports"] = requested
++    coverage["profile"] = meta.get("profile")
++    targets = meta.get("authorized_targets") or [host.get("ip") for host in parsed.get("hosts", []) if host.get("ip")]
++    if not targets:
++        try:
++            targets = [str(ipaddress.ip_address(meta.get("target")))]
++        except (ValueError, TypeError):
++            targets = [web_origin["host"]] if web_origin else []
++    components = {
++        "network": _component(network_state, {"coverage": coverage, "hosts": parsed.get("hosts", []),
++                          "observations": parsed.get("observations", []), "parsed": parsed},
++                          f"Recorded network state: {raw_network or 'unknown legacy coverage'}"),
++        "http": _component(http_state, {"origin": web_origin, "response": http, "headers": {
++                           str(key).lower(): value for key, value in (http.get("headers") or {}).items()},
++                           "redirects": audit.get("redirects", []), "error": audit.get("error"),
++                           "error_category": audit.get("error_category")}, "Saved HTTP response coverage"),
++        "tls": _component(tls_state, {"origin": web_origin, "details": tls}, "Saved verified TLS evidence"),
++        "paths": _component(path_state, {"origin": web_origin, "observations": paths or [],
++                             "coverage": {"words": words, "method": "gobuster-dir-no-follow-v1" if words is not None else None},
++                             "job_status": raw_paths}, "Optional discovery coverage; absence is not a vulnerability verdict"),
++    }
++    states = [item["status"] for item in components.values()]
++    status = ("partial" if "partial" in states or ("failed" in states and "completed" in states) else
++              "failed" if "failed" in states or meta.get("status") == "failed" else
++              "completed" if "completed" in states else "not_run")
++    return {"schema_version": SCHEMA_VERSION, "scan_id": meta["scan_id"], "target": meta.get("target"),
++            "timestamp": meta.get("completed_at") or meta.get("created_at"), "created_at": meta.get("created_at"),
++            "status": status, "job_status": meta.get("status"), "identity": {"target_key": target_key(meta.get("target")), "targets": sorted(set(targets)), "web_origin": web_origin},
++            "components": components, "findings": [], "metadata": meta,
++            "raw_evidence": {"artifacts": artifacts or [], "http_assessment": audit,
++                             "nmap_execution": nmap_record, "path_execution": path_record}}
++
++
++def artifact_manifest(directory, names):
++    result = []
++    for name in names:
++        path = directory / name
++        if path.is_file():
++            result.append({"file": name, "bytes": path.stat().st_size,
++                           "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
++    return result
+diff --git a/docs/DAYS-07-13.md b/docs/DAYS-07-13.md
+new file mode 100644
+--- /dev/null
++++ b/docs/DAYS-07-13.md
+@@ -0,0 +1,224 @@
++# RiskLens 2.0 — Days 7–13
++
++## Implemented against the current Days 1–6 source
++
++Day 7: independent Web scans, safe saved-result reopening, partial-result
++display, and the existing Network/combined paths retained. The real loopback
++integration test caught and fixed a Windows closed-socket error after reading a
++complete HTTP body. Web-only assessment needs neither Nmap nor Gobuster.
++
++Day 8: finalized jobs atomically save `backend/scans/snapshot_<id>.json` with
++schema version, target identity, assessment timestamps, job/snapshot status,
++per-component completion, hosts/ports/services/versions, normalized headers,
++TLS details, paths, findings, original evidence, artifact names and SHA-256.
++Components are `completed`, `partial`, `failed`, or `not_run`. Older scans are
++normalized in memory on GET; GET does not write snapshots or start work. The
++explicit offline migration below can persist those legacy snapshots.
++
++Day 9: the new offline delta engine returns `added`, `removed`, `changed`, and
++`uncertain`, with component, observation key, before/after and reason. No event
++means “confirmed vulnerability” or “fixed”. Closed-port removals require
++completed network coverage plus explicit closed evidence, or an up host with
++matching scanned-port coverage and unambiguous, count-consistent closed
++extraports. Filtered/down/missing/failed coverage remains uncertain. Service
++identity changes involving unknown values are uncertain. Header comparisons
++require complete HTTP evidence with the same response status and web origin;
++TLS changes require verified coverage. Path absence needs completed scans with
++the same exact wordlist and origin. Unknown legacy coverage stays uncertain.
++
++Day 10: validated UUIDs and same-target identities; mismatched requested targets
++or web scheme/IP/port return 409. The comparison endpoint only reads saved data.
++Invalid UUID: 400; absent scan: 404; active scan/incompatible identities: 409;
++corrupt/unsupported snapshot or artifact: 422. Incomplete terminal scans return
++uncertainty rather than invented removals. Self-comparison is allowed.
++
++Day 11: Compare Scans tab with baseline/current selectors, categorized
++before/after tables, loading/empty/error states and comparison export buttons.
++Network, Web, history and reporting remain. Removed runtime CDN dependencies;
++local CSS and a native SVG evidence graph keep the UI offline. Restoring a scan
++loads saved snapshots/results instead of trusting cached rendered HTML.
++
++Day 12: frontend findings, Web findings, PDF and CSV use the snapshot's persisted
++finding list. PDF includes target, timestamp, component coverage, separate
++Network/Web findings, severity, confidence, evidence and remediation/re-test.
++CSV includes the same findings plus target/timestamp and optional differences.
++Unverified CVE candidates retain their conservative labels and confidence.
++
++Day 13: regression tests for normalization, deltas, invalid/missing/partial
++scans, read-only routes, independent Web operation, HTTP/TLS behavior, frontend
++comparison states and export consistency; a real owned-loopback HTTP demo test.
++
++## Changed files
++
++Modified:
++
++- [backend/main.py](../backend/main.py): integration, finalization, new APIs,
++  shared snapshot findings and export inputs. Existing `/scan` requests keep
++  `network_scan: true` by default; Web UI sends false.
++- [backend/report_generator.py](../backend/report_generator.py): wrapped,
++  escaped PDF content from shared persisted evidence; optional differences.
++- [backend/scanner/web_assessment.py](../backend/scanner/web_assessment.py): stop
++  reading a closed response and always close the response object.
++- [backend/scanner/path_discovery.py](../backend/scanner/path_discovery.py): a
++  zero exit code with request-error diagnostics is incomplete coverage, not a
++  successful negative discovery result.
++- [frontend/static/app.js](../frontend/static/app.js),
++  [frontend/templates/index.html](../frontend/templates/index.html): separate
++  Web operation, safe reopening, comparison UI and local graph rendering.
++- [tests/test_read_only_endpoints.py](../tests/test_read_only_endpoints.py): test
++  both comparison ID placeholders with saved IDs and existing I/O tripwires.
++
++New:
++
++- [backend/snapshots.py](../backend/snapshots.py)
++- [backend/delta_engine.py](../backend/delta_engine.py)
++- [frontend/static/css/app.css](../frontend/static/css/app.css)
++- [scripts/local_lab.py](../scripts/local_lab.py)
++- [scripts/normalize_saved_scans.py](../scripts/normalize_saved_scans.py)
++- [tests/test_snapshots_comparison.py](../tests/test_snapshots_comparison.py)
++- [tests/test_local_lab.py](../tests/test_local_lab.py)
++- [tests/test_comparison.js](../tests/test_comparison.js)
++- This guide, [exact changes](../artifacts/days7-13-changes.patch), and the
++  updated source ZIP. Earlier working-tree edits were preserved.
++
++No new package, database, AI feature, cloud service or automatic credential
++testing was added. The source ZIP excludes private scan history, environments,
++Git metadata and installed scanner binaries. Existing history remains in your
++working directory; back it up separately if moving machines. Do not apply the
++patch again to the already updated project.
++
++## API essentials
++
++```text
++POST /scan                  Existing Network or combined API
++POST /webscan               Independent Web; {url, authorized, path_discovery:false}
++GET  /scans/history          Existing history
++GET  /scans/{id}/snapshot    Saved snapshot, or read-only legacy normalization
++GET  /scans/{new_id}/compare/{old_id}
++GET  /scan/{id}/findings     Shared persisted Network + Web findings
++GET  /webscan/{id}/findings  Shared persisted Web findings
++GET  /scan/{id}/report.pdf?baseline={optional_old_id}
++GET  /scan/{id}/findings.csv?baseline={optional_old_id}
++```
++
++Essential new request field, preserving old combined behavior:
++
++```json
++{"target":"http://127.0.0.1:8080","profile":"web","authorized":true,"network_scan":false,"path_discovery":false}
++```
++
++Authorization and the current operator's IP/port allowlists remain mandatory
++for all new scans. No redirects, insecure certificate retry, credential guessing
++or exploitation. Gobuster remains opt-in with one worker, delay, bounded input,
++deadline and stop handling from Day 6. Compare/reopen/report requests do no active
++assessment and do not require the old target to remain in the current scope.
++
++## Windows PowerShell setup, launch and tests
++
++From an extracted source ZIP or checkout:
++
++```powershell
++Set-Location 'D:\security project'
++# Only create if this environment does not already exist:
++py -m venv .venv-baseline
++& '.\.venv-baseline\Scripts\python.exe' -m pip install -r .\requirements-dev.txt
++$env:RISKLENS_ALLOWED_TARGETS = '127.0.0.1/32,::1/128'
++$env:RISKLENS_ALLOWED_WEB_PORTS = '8080,8443'
++& '.\.venv-baseline\Scripts\python.exe' -m uvicorn backend.main:app --host 127.0.0.1 --port 8787
++```
++
++Network/combined scans additionally require installed Nmap on PATH or a validated
++absolute `RISKLENS_NMAP_PATH`. Optional discovery needs Gobuster similarly.
++Web-only checks and the header demo below need neither executable. Existing
++`run.ps1` still expects `.venv` and binds localhost; direct commands above use
++the environment verified for this task.
++
++Tests (run in a separate terminal):
++
++```powershell
++Set-Location 'D:\security project'
++& '.\.venv-baseline\Scripts\python.exe' -B -m unittest discover -s tests
++node .\tests\test_service_details.js
++node .\tests\test_web_assessment.js
++node .\tests\test_path_discovery.js
++node .\tests\test_comparison.js
++git diff --check
++```
++
++Expected: 104 Python tests `OK`, four frontend `PASS` lines. The local-lab test
++uses only an ephemeral port on 127.0.0.1; Nmap/Gobuster calls are mocked or
++forbidden in automated tests. Certificate failure, redirect escape and timeout
++cases use mocks. Existing Starlette template deprecation warning is harmless.
++
++Optional one-time legacy migration: stop the backend first, back up
++`backend/scans`, then run:
++
++```powershell
++& '.\.venv-baseline\Scripts\python.exe' -B -m scripts.normalize_saved_scans
++```
++
++It preserves existing snapshots and never contacts saved targets. If active or
++interrupted jobs remain, it refuses migration until startup reconciliation has
++run and the backend is stopped. Legacy completion cannot be reconstructed from
++file size; unknown coverage remains partial/uncertain.
++
++## Safe localhost demo: baseline, change, rescan, compare, export
++
++With the backend running, start the owned fixture in terminal 2:
++
++```powershell
++Set-Location 'D:\security project'
++New-Item -ItemType Directory -Force .\artifacts | Out-Null
++'{"nosniff":false}' | Set-Content -Encoding utf8 .\artifacts\lab-state.json
++& '.\.venv-baseline\Scripts\python.exe' -m scripts.local_lab --port 8080 --state .\artifacts\lab-state.json
++```
++
++In terminal 3:
++
++```powershell
++Set-Location 'D:\security project'
++$api = 'http://127.0.0.1:8787'
++Invoke-RestMethod "$api/health"
++function New-LocalWebAssessment {
++    $body = @{url='http://127.0.0.1:8080'; authorized=$true; path_discovery=$false} | ConvertTo-Json
++    $job = Invoke-RestMethod -Method Post "$api/webscan" -ContentType 'application/json' -Body $body
++    $deadline = (Get-Date).AddSeconds(60)
++    do {
++        Start-Sleep -Milliseconds 500
++        $status = Invoke-RestMethod "$api/scan/$($job.scan_id)"
++    } while ($status.status -in @('pending','running','nmap_done') -and (Get-Date) -lt $deadline)
++    if ($status.status -ne 'completed') { throw "Local assessment did not complete: $($status.message)" }
++    return $job.scan_id
++}
++$oldId = New-LocalWebAssessment
++'{"nosniff":true}' | Set-Content -Encoding utf8 .\artifacts\lab-state.json
++$newId = New-LocalWebAssessment
++$comparison = Invoke-RestMethod "$api/scans/$newId/compare/$oldId"
++$comparison | ConvertTo-Json -Depth 20
++Invoke-WebRequest "$api/scan/$newId/report.pdf?baseline=$oldId" -OutFile .\artifacts\localhost-comparison.pdf
++Invoke-WebRequest "$api/scan/$newId/findings.csv?baseline=$oldId" -OutFile .\artifacts\localhost-comparison.csv
++```
++
++Expected: HTTP 200 in both snapshots, Network/paths `not_run`, HTTP `completed`.
++The comparison has an `added` HTTP `security_header` entry with key
++`x-content-type-options`, before null, after `nosniff`. Baseline finding
++`WEB-HDR-003` is absent from the new persisted finding list; other missing-header
++observations remain. Unassessed Network/TLS/path components remain uncertain,
++never “fixed”. Open the local UI, choose Compare Scans and select those IDs to
++see the same differences. Reopen each history entry without new target requests.
++PDF/CSV contain the current saved findings and those differences. Stop both
++servers with Ctrl+C when done.
++
++## Remaining limits
++
++The native offline graph uses a static SVG layout rather than the previous CDN
++physics layout. Full browser layout/accessibility has not been exhaustively
++tested; frontend handlers are exercised with Node. No live Nmap/Gobuster or
++real-certificate scan was run during this implementation; those workers retain
++their mocked regression coverage and need installed Windows binaries for a live
++network demo. Snapshots use local JSON and one backend process; there is no
++multi-process storage coordination. Evidence hashes support inspection, not
++tamper-proof signing. Very large artifacts are bounded and can be rejected.
++Legacy missing timestamps/coverage/wordlists cannot be invented. TLS/headers
++retain Day 5's inactivity/slow-header limits. Deltas compare observations rather
++than confirming product identity, exploitability or remediation.
+diff --git a/frontend/static/app.js b/frontend/static/app.js
+--- a/frontend/static/app.js
++++ b/frontend/static/app.js
+@@ -52,154 +52,12 @@
+ 
+   const saved = localStorage.getItem("pcvp:lastScanId");
+   if (saved) {
+-    try {
+-      const resp = await fetch(`/scan/${saved}`);
+-      if (resp.ok) {
+-        currentScanId = saved;
+-        statusDiv.textContent = `Restored last scan: ${currentScanId}`;
+-        updateHeaderScanInfo();
+-
+-        const cachedHtml = localStorage.getItem("pcvp:lastServicesHtml");
+-        const cachedStats = localStorage.getItem("pcvp:lastStats");
+-        const cachedServices = localStorage.getItem("pcvp:lastServices");
+-        let hasCachedServices = false;
+-
+-        if (cachedServices) {
+-        try {
+-          currentServices = JSON.parse(cachedServices);
+-          hasCachedServices = true;
+-        } catch (e) {}
+-      }
+-
+-      if (cachedHtml) {
+-        document.querySelector("#services-table tbody").innerHTML = cachedHtml;
+-        // ✅ Re-attach click listeners after restoring HTML
+-        document.querySelector("#services-table tbody")
+-          .querySelectorAll(".btn-link")
+-          .forEach((btn) => btn.addEventListener("click", onDetailsClick));
+-        hasCachedServices = true;
+-      }
+-
+-
+-        if (cachedStats) {
+-          const stats = JSON.parse(cachedStats);
+-          document.getElementById("stat-hosts").textContent = stats.hosts || "0";
+-          document.getElementById("stat-services").textContent = stats.services || "0";
+-          document.getElementById("stat-critical").textContent = stats.critical || "0 / 0";
+-          document.getElementById("stat-weak-creds").textContent = stats.weak || "0";
+-          hasCachedServices = true;
+-        }
+-
+-       const cachedGraphText = localStorage.getItem("pcvp:lastGraphText");
+-const cachedGraph = localStorage.getItem("pcvp:lastGraph");
+-let hasCachedGraph = false;
+-
+-if (cachedGraphText) {
+-  document.getElementById("attack-graph-content").innerHTML = cachedGraphText;
+-  hasCachedGraph = true;
+-}
+-
+-// ✅ Re-render vis.js network from cached graph data
+-if (cachedGraph) {
+-  try {
+-    const graph = JSON.parse(cachedGraph);
+-    const nodes = graph.nodes || [];
+-    const edges = graph.edges || [];
+-    const graphContainer = document.getElementById("attack-graph-network");
+-    graphContainer.innerHTML = "";
+-
+-    if (nodes.length && edges.length) {
+-      const visNodes = new vis.DataSet(
+-        nodes.map((n) => {
+-          let label = n.id, color = "#6b7280", shape = "ellipse";
+-          if (n.type === "host") { label = n.ip || n.id; color = "#1d4ed8"; shape = "box"; }
+-          else if (n.type === "service") {
+-            const level = (n.pcvp_level || "").toLowerCase();
+-            label = `${n.service || "svc"}\n${n.port || ""}/${n.protocol || ""}`;
+-            if (level === "critical") color = "#dc2626";
+-            else if (level === "high") color = "#f97316";
+-            else if (level === "medium") color = "#eab308";
+-            else if (level === "low") color = "#22c55e";
+-            else color = "#6b7280";
+-          } else if (n.type === "cve") { 
+-            label = n.cve_id || "CVE"; 
+-            color = "#0ea5e9"; 
+-            shape = "diamond"; 
+-          }
+-          return { id: n.id, label, color, shape, font: { color: "#e5e7eb", size: 12 } };
+-        })
+-      );
+-
+-      const visEdges = new vis.DataSet(
+-        edges.map((e) => {
+-          let color = "#4b5563", dashes = false, label = "";
+-          if (e.relation === "runs") { label = "runs"; color = "#6b7280"; }
+-          else if ((e.relation === "candidate_cve" || e.relation === "has_vulnerability")) { label = "unverified CVE candidate"; color = "#0ea5e9"; }
+-          else if (e.relation === "possible_chain") { label = "unverified association"; color = "#f97316"; dashes = true; }
+-          return { from: e.from, to: e.to, color, dashes, arrows: "to", label, font: { align: "middle", color: "#9ca3af", size: 10 } };
+-        })
+-      );
+-
+-      new vis.Network(graphContainer, { nodes: visNodes, edges: visEdges }, {
+-        autoResize: true,
+-        physics: { stabilization: true, barnesHut: { springLength: 120, springConstant: 0.01 } },
+-        interaction: { tooltipDelay: 200, hover: true },
+-        nodes: { borderWidth: 1 },
+-        layout: { improvedLayout: true },
+-      });
+-    }
+-  } catch (e) {
+-    console.error("Failed to restore attack graph network:", e);
+-  }
+-}
+-
+-        const cachedGobuster = localStorage.getItem("pcvp:lastGobusterHtml");
+-        let hasCachedGobuster = false;
+-        if (cachedGobuster) {
+-          document.querySelector("#gobuster-table tbody").innerHTML = cachedGobuster;
+-          hasCachedGobuster = true;
+-        }
+-
+-       if (!hasCachedServices) loadScanResults(currentScanId);
+-       loadAliveHosts(currentScanId);
+-       loadWebAssessment(currentScanId);
+-       if (!hasCachedGobuster) loadGobusterResults(currentScanId);
+-       if (!hasCachedGraph) loadAttackGraph(currentScanId);
+-
+-        // ✅ Only poll if scan is not already completed
+-        const scanData = await fetch(`/scan/${currentScanId}`).then(r => r.json());
+-        if (scanData.status !== "completed") {
+-          pollScanStatus(currentScanId);
+-        } else {
+-          statusDiv.textContent = `Restored last scan: ${currentScanId}`;
+-          const reportBtn = document.getElementById("download-report-btn");
+-          if (reportBtn) reportBtn.disabled = false;
+-        }
+-      } else {
+-        localStorage.removeItem("pcvp:lastScanId");
+-        localStorage.removeItem("pcvp:lastServicesHtml");
+-        localStorage.removeItem("pcvp:lastStats");
+-        localStorage.removeItem("pcvp:lastServices");
+-        localStorage.removeItem("pcvp:lastGobusterHtml");
+-        localStorage.removeItem("pcvp:lastGraphText");
+-        resetOverview();
+-        setTableLoadingStates();
+-        updateHeaderScanInfo();
+-        statusDiv.textContent = "";
+-      }
+-    } catch (e) {
+-      localStorage.removeItem("pcvp:lastScanId");
+-      localStorage.removeItem("pcvp:lastServicesHtml");
+-      localStorage.removeItem("pcvp:lastStats");
+-      localStorage.removeItem("pcvp:lastGobusterHtml");
+-      localStorage.removeItem("pcvp:lastGraphText");
+-      resetOverview();
+-      setTableLoadingStates();
+-      updateHeaderScanInfo();
+-      statusDiv.textContent = "";
+-    }
+-  }
+-
++    try { await restoreHistoricalScan(saved); }
++    catch (error) { statusDiv.textContent = "Saved results are unavailable: " + error.message; }
++  }
++  document.getElementById("compare-scans-btn").addEventListener("click", compareSelectedScans);
++  document.getElementById("compare-pdf").addEventListener("click", () => exportComparison("pdf"));
++  document.getElementById("compare-csv").addEventListener("click", () => exportComparison("csv"));
+   const savedTarget = localStorage.getItem("pcvp:lastTarget");
+   const savedExposure = localStorage.getItem("pcvp:lastExposure");
+   if (savedTarget) document.getElementById("target").value = savedTarget;
+@@ -306,7 +164,7 @@
+       const resp = await fetch("/scan", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ target, exposure, profile, authorized,
++        body: JSON.stringify({ target, exposure, profile, authorized, network_scan: profile !== "web",
+           path_discovery: profile === "web" && document.getElementById("path-discovery").checked }),
+       });
+ 
+@@ -359,6 +217,7 @@
+     const response = await fetch("/scans/history");
+     if (!response.ok) throw new Error(`History request failed: ${response.status}`);
+     const scans = await response.json();
++    populateComparisonSelectors(scans);
+     if (!scans.length) {
+       body.innerHTML = `<tr><td colspan="6" class="px-3 py-2">No scans recorded yet.</td></tr>`;
+       return;
+@@ -438,15 +297,8 @@
+   document.getElementById("path-discovery").disabled = scan.profile !== "web";
+   resetOverview();
+   setTableLoadingStates();
+-  if (scan.status === "completed") {
+-    await Promise.all([
+-      loadScanResults(scan.scan_id),
+-      loadFindings(scan.scan_id),
+-      loadAliveHosts(scan.scan_id),
+-      loadGobusterResults(scan.scan_id),
+-      loadWebAssessment(scan.scan_id),
+-      loadAttackGraph(scan.scan_id),
+-    ]);
++  if (["completed", "failed", "partial", "cancelled"].includes(scan.status)) {
++    await renderSavedScan(scan.scan_id);
+     document.getElementById("download-report-btn").disabled = false;
+   } else {
+     pollScanStatus(scan.scan_id);
+@@ -514,32 +366,7 @@
+         statusDiv.textContent = `Loading results...`;
+ 
+         try {
+-          await Promise.all([
+-            loadScanResults(scanId).catch(e => {
+-              console.error("[LOADING] loadScanResults failed:", e);
+-              throw e;
+-            }),
+-            loadFindings(scanId).catch(e => {
+-              console.error("[LOADING] loadFindings failed:", e);
+-              throw e;
+-            }),
+-            loadAliveHosts(scanId).catch(e => {
+-              console.error("[LOADING] loadAliveHosts failed:", e);
+-              throw e;
+-            }),
+-            loadGobusterResults(scanId).catch(e => {
+-              console.error("[LOADING] loadGobusterResults failed:", e);
+-              throw e;
+-            }),
+-            loadWebAssessment(scanId).catch(e => {
+-              console.error("[LOADING] loadWebAssessment failed:", e);
+-              throw e;
+-            }),
+-            loadAttackGraph(scanId).catch(e => {
+-              console.error("[LOADING] loadAttackGraph failed:", e);
+-              throw e;
+-            }),
+-          ]);
++          await renderSavedScan(scanId);
+           statusDiv.textContent = data.message || "Assessment completed.";
+           await loadScanHistory();
+         } catch (loadErr) {
+@@ -553,14 +380,16 @@
+         startBtn.disabled = false;
+         if (reportBtn) reportBtn.disabled = true;
+         statusDiv.textContent = `Scan failed: ${data.message || "unknown error"}`;
+-        await Promise.allSettled([loadWebAssessment(scanId), loadGobusterResults(scanId), loadFindings(scanId)]);
++        await renderSavedScan(scanId);
++        if (reportBtn) reportBtn.disabled = false;
++        await loadScanHistory();
+ 
+       } else if (data.status === "nmap_done") {
+         // ✅ Nmap done but gobuster still running
+         if (data.gobuster_status === "completed") {
+           statusDiv.textContent = `Gobuster completed. Finalizing...`;
+         } else {
+-          statusDiv.textContent = `Nmap completed. HTTP/TLS: ${data.web_status || "pending"}; optional path discovery: ${data.gobuster_status}.`;
++          statusDiv.textContent = `${data.network_scan === false ? "Web assessment running" : "Nmap completed"}. HTTP/TLS: ${data.web_status || "pending"}; optional path discovery: ${data.gobuster_status}.`;
+           if (data.web_status === "completed") await loadWebAssessment(scanId);
+         }
+ 
+@@ -858,41 +687,7 @@
+     const nodeById = {};
+     nodes.forEach((n) => (nodeById[n.id] = n));
+ 
+-    const visNodes = new vis.DataSet(
+-      nodes.map((n) => {
+-        let label = n.id, color = "#6b7280", shape = "ellipse";
+-        if (n.type === "host") { label = n.ip || n.id; color = "#1d4ed8"; shape = "box"; }
+-        else if (n.type === "service") {
+-          const level = (n.pcvp_level || "").toLowerCase();
+-          label = `${n.service || "svc"}\n${n.port || ""}/${n.protocol || ""}`;
+-          if (level === "critical") color = "#dc2626";
+-          else if (level === "high") color = "#f97316";
+-          else if (level === "medium") color = "#eab308";
+-          else if (level === "low") color = "#22c55e";
+-          else color = "#6b7280";
+-        } else if (n.type === "cve") { label = n.cve_id || "CVE"; color = "#0ea5e9"; shape = "diamond"; }
+-        return { id: n.id, label, color, shape, font: { color: "#e5e7eb", size: 12 } };
+-      })
+-    );
+-
+-    const visEdges = new vis.DataSet(
+-      edges.map((e) => {
+-        let color = "#4b5563", dashes = false, label = "";
+-        if (e.relation === "runs") { label = "runs"; color = "#6b7280"; }
+-        else if ((e.relation === "candidate_cve" || e.relation === "has_vulnerability")) { label = "unverified CVE candidate"; color = "#0ea5e9"; }
+-        else if (e.relation === "possible_chain") { label = "unverified association"; color = "#f97316"; dashes = true; }
+-        return { from: e.from, to: e.to, color, dashes, arrows: "to", label, font: { align: "middle", color: "#9ca3af", size: 10 } };
+-      })
+-    );
+-
+-    new vis.Network(graphContainer, { nodes: visNodes, edges: visEdges }, {
+-      autoResize: true,
+-      physics: { stabilization: true, barnesHut: { springLength: 120, springConstant: 0.01 } },
+-      interaction: { tooltipDelay: 200, hover: true },
+-      nodes: { borderWidth: 1 },
+-      layout: { improvedLayout: true },
+-    });
+-
++    graphContainer.innerHTML = renderLocalGraph(graph);
+     const hostServices = {};
+     edges.forEach((e) => {
+       if (e.relation === "runs") {
+@@ -1008,3 +803,97 @@
+   if (!currentScanId) { alert("Run a scan first, then download the report."); return; }
+   window.location.href = `/scan/${currentScanId}/report.pdf`;
+ }
++
++
++function renderLocalGraph(graph) {
++  const nodes = Object.fromEntries((graph.nodes || []).map(node => [node.id, node]));
++  const label = id => {const node = nodes[id] || {}; return node.ip || node.cve_id || `${node.service || id}${node.port ? ":" + node.port : ""}`;};
++  const positions = {}, rows = [0, 0, 0];
++  for (const node of graph.nodes || []) {
++    const column = node.type === "host" ? 0 : node.type === "service" ? 1 : 2;
++    positions[node.id] = {x: 125 + column * 310, y: 40 + rows[column]++ * 65};
++  }
++  const height = Math.max(240, Math.max(...rows) * 65 + 30);
++  const lines = (graph.edges || []).filter(edge => positions[edge.from] && positions[edge.to]).map(edge => {
++    const from = positions[edge.from], to = positions[edge.to];
++    return `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" stroke="#64748b" />`;
++  }).join("");
++  const shapes = Object.entries(positions).map(([id, point]) => `<g><rect x="${point.x - 115}" y="${point.y - 20}" width="230" height="40" rx="6" fill="#172533" stroke="#f59e0b"/><text x="${point.x}" y="${point.y + 4}" text-anchor="middle" fill="#edf2f7" font-size="12">${escapeHtml(label(id))}</text></g>`).join("");
++  return `<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Saved network observations and unverified associations" width="900" height="${height}">${lines}${shapes}</svg>` + '<strong>Saved evidence associations (not proven attack paths)</strong><ul>' + (graph.edges || []).map(edge => {
++    return `<li>${escapeHtml(label(edge.from))} &rarr; ${escapeHtml(edge.relation === "runs" ? "runs" : "unverified association")} &rarr; ${escapeHtml(label(edge.to))}</li>`;
++  }).join("") + '</ul>';
++}
++
++async function renderSavedScan(scanId) {
++  const response = await fetch(`/scans/${encodeURIComponent(scanId)}/snapshot`);
++  if (!response.ok) throw new Error((await response.json()).detail || "Cannot load snapshot");
++  const snapshot = await response.json();
++  await loadFindings(scanId);
++  const components = snapshot.components;
++  if (components.network.status !== "not_run" && components.network.hosts.length) {
++    await loadScanResults(scanId);
++    if (components.network.status === "completed") await Promise.all([loadAliveHosts(scanId), loadAttackGraph(scanId)]);
++    else {
++      document.querySelector("#alive-hosts-table tbody").innerHTML = `<tr><td colspan="6">Partial network coverage: ${escapeHtml(components.network.hosts.map(host => host.ip).join(", "))}</td></tr>`;
++      document.getElementById("attack-graph-content").textContent = "Network coverage is incomplete; review the saved observations.";
++      document.getElementById("attack-graph-network").innerHTML = "";
++    }
++  } else {
++    document.querySelector("#services-table tbody").innerHTML = `<tr><td colspan="9">Network component: ${escapeHtml(components.network.status)}. No saved port observations.</td></tr>`;
++    document.querySelector("#alive-hosts-table tbody").innerHTML = '<tr><td colspan="6">No saved host observations.</td></tr>';
++    document.getElementById("attack-graph-content").textContent = "No saved network graph for this assessment.";
++    document.getElementById("attack-graph-network").innerHTML = "";
++  }
++  if (components.http.status !== "not_run") await loadWebAssessment(scanId);
++  else {
++    document.getElementById("web-assessment").textContent = "HTTP/TLS was not run for this scan.";
++    document.getElementById("web-findings").textContent = "No web component was assessed.";
++  }
++  await loadGobusterResults(scanId);
++}
++
++function populateComparisonSelectors(scans) {
++  const options = scans.map(scan => `<option value="${escapeHtml(scan.scan_id)}">${escapeHtml(scan.created_at || "Unknown time")} | ${escapeHtml(scan.target)} | ${escapeHtml(scan.profile)} | ${escapeHtml(scan.status)}</option>`).join("");
++  for (const id of ["compare-old", "compare-new"]) {
++    const element = document.getElementById(id);
++    if (!element) continue;
++    const selected = element.value;
++    element.innerHTML = '<option value="">Select saved scan</option>' + options;
++    if (scans.some(scan => scan.scan_id === selected)) element.value = selected;
++  }
++  const old = document.getElementById("compare-old"), current = document.getElementById("compare-new");
++  if (current && !current.value && scans.length) current.value = scans[0].scan_id;
++  if (old && !old.value && scans.length > 1) old.value = scans[1].scan_id;
++}
++
++async function compareSelectedScans() {
++  const output = document.getElementById("comparison-results");
++  const oldId = document.getElementById("compare-old").value;
++  const newId = document.getElementById("compare-new").value;
++  if (!oldId || !newId) {output.textContent = "Select baseline and current scans."; return;}
++  output.textContent = "Comparing saved evidence...";
++  try {
++    const response = await fetch(`/scans/${encodeURIComponent(newId)}/compare/${encodeURIComponent(oldId)}`);
++    const data = await response.json();
++    if (!response.ok) throw new Error(data.detail || "Comparison failed");
++    output.innerHTML = renderComparison(data);
++  } catch (error) {output.textContent = "Comparison unavailable: " + error.message;}
++}
++
++function renderComparison(data) {
++  let html = '<p>Observation changes only. Missing or incomplete coverage never confirms a fix.</p>';
++  for (const category of ["added", "removed", "changed", "uncertain"]) {
++    const entries = data[category] || [];
++    html += `<h3>${escapeHtml(category)} (${entries.length})</h3>`;
++    html += entries.length ? '<table><thead><tr><th>Component / observation</th><th>Before</th><th>After</th><th>Evidence limits</th></tr></thead><tbody>' + entries.map(entry => `<tr><td>${escapeHtml(entry.component)} / ${escapeHtml(entry.kind)}<br>${escapeHtml(entry.key)}</td><td><pre>${escapeHtml(JSON.stringify(entry.before, null, 2))}</pre></td><td><pre>${escapeHtml(JSON.stringify(entry.after, null, 2))}</pre></td><td>${escapeHtml(entry.reason)}</td></tr>`).join("") + '</tbody></table>' : '<p>No entries in this category.</p>';
++  }
++  if (!["added", "removed", "changed"].some(key => (data[key] || []).length)) html += '<p>No comparable exposure changes observed. Review uncertain coverage above.</p>';
++  return html;
++}
++
++function exportComparison(format) {
++  const oldId = document.getElementById("compare-old").value;
++  const newId = document.getElementById("compare-new").value;
++  if (!oldId || !newId) return;
++  window.location.href = `/scan/${encodeURIComponent(newId)}/${format === "pdf" ? "report.pdf" : "findings.csv"}?baseline=${encodeURIComponent(oldId)}`;
++}
+diff --git a/frontend/static/css/app.css b/frontend/static/css/app.css
+new file mode 100644
+--- /dev/null
++++ b/frontend/static/css/app.css
+@@ -0,0 +1,36 @@
++/* Local styles; no CDN or build step. */
++* { box-sizing: border-box; }
++body { margin: 0; background: #0b0d10; color: #edf2f7; font: 15px/1.5 system-ui, sans-serif; }
++header, main { padding: 1.25rem; max-width: 1500px; margin: auto; }
++section { margin-bottom: 1.25rem; }
++button, input, select { font: inherit; padding: .55rem .75rem; color: inherit; background: #171c22; border: 1px solid #46515f; border-radius: .5rem; max-width: 100%; }
++button { cursor: pointer; }
++button:hover { border-color: #f59e0b; }
++button:disabled { opacity: .45; cursor: default; }
++input[type=checkbox] { width: auto; }
++label { display: inline-block; margin: .35rem .5rem .35rem 0; }
++select { max-width: 100%; }
++table { width: 100%; border-collapse: collapse; }
++th, td { padding: .55rem; text-align: left; border-bottom: 1px solid #27303a; vertical-align: top; overflow-wrap: anywhere; }
++pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; max-width: 100%; }
++a { color: #7dd3fc; }
++h1 { font-size: 1.6rem; } h2 { font-size: 1.3rem; } h3 { font-size: 1.05rem; }
++.hidden { display: none !important; }
++.flex { display: flex; } .flex-wrap { flex-wrap: wrap; } .flex-col { flex-direction: column; }
++.grid { display: grid; gap: 1rem; } .items-center { align-items: center; }
++.justify-between { justify-content: space-between; } .justify-end { justify-content: flex-end; }
++.gap-2 { gap: .5rem; } .gap-3 { gap: .75rem; } .gap-4 { gap: 1rem; }
++.p-4, .p-5 { padding: 1rem; } .p-3 { padding: .75rem; }
++.mt-3, .mt-4 { margin-top: 1rem; } .mb-2 { margin-bottom: .5rem; }
++.rounded-2xl, .rounded-xl { border-radius: .8rem; }
++.glass { padding: 1rem; border: 1px solid #27303a; background: #12161b; }
++.overflow-auto { overflow: auto; } .w-full, .min-w-full { width: 100%; }
++#attack-graph-network { overflow: auto; }
++.font-bold, .font-extrabold { font-weight: 700; } .text-sm { font-size: .9rem; }
++.text-xs { font-size: .8rem; } .text-3xl { font-size: 1.8rem; }
++.bg-orange-500 { background: #f59e0b; color: #111; }
++.fixed { position: fixed; } .inset-0 { inset: 0; } .z-50 { z-index: 50; }
++#service-details-modal { background: #000b; align-items: center; justify-content: center; padding: 1rem; }
++#service-details-modal > div { width: min(92vw, 850px); background: #12161b; padding: 1rem; max-height: 85vh; overflow: auto; }
++.space-y-4 > * + *, .space-y-6 > * + * { margin-top: 1rem; }
++@media (min-width: 800px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+diff --git a/frontend/templates/index.html b/frontend/templates/index.html
+--- a/frontend/templates/index.html
++++ b/frontend/templates/index.html
+@@ -5,12 +5,7 @@
+   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+   <title>RiskLens – Security Assessment Platform</title>
+ 
+-  <!-- Tailwind (no build step) -->
+-  <script src="https://cdn.tailwindcss.com"></script>
+-
+-  <!-- vis-network -->
+-  <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
+-  <link rel="stylesheet" href="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.css"/>
++  <link rel="stylesheet" href="/static/css/app.css" />
+ 
+   <style>
+     :root {
+@@ -155,7 +150,7 @@
+               <select id="profile" class="mt-1 w-full min-w-0 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2">
+                 <option value="standard">Standard: up to 1,000 TCP ports, light version detection</option>
+                 <option value="quick">Quick: up to 100 TCP ports</option>
+-                <option value="web">Web: HTTP/TLS assessment; optional path discovery</option>
++                <option value="web">Web only: HTTP/TLS assessment; optional path discovery</option>
+                 <option value="vulnerability" disabled>Vulnerability assessment (disabled)</option>
+                 <option value="full" disabled>Full lab assessment (disabled)</option>
+               </select>
+@@ -191,10 +186,11 @@
+     <section class="glass border border-slate-800 rounded-2xl p-4">
+       <div class="flex flex-wrap gap-2">
+         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-overview">Overview</button>
+-        <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-services">Services</button>
++        <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-services">Network</button>
+         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-findings">Findings</button>
+         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-attack">Attack Graph</button>
+         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-web">Web Scan</button>
++        <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-compare">Compare Scans</button>
+       </div>
+     </section>
+ 
+@@ -355,6 +351,16 @@
+         </table>
+       </div>
+     </section>
++    <section id="tab-compare" class="tab-panel hidden glass p-4">
++      <h2>Exposure Change Detector</h2>
++      <p>Compare saved scans of the same target. No scans or external requests are started.</p>
++      <label>Baseline <select id="compare-old"><option value="">Select saved scan</option></select></label>
++      <label>Current <select id="compare-new"><option value="">Select saved scan</option></select></label>
++      <button id="compare-scans-btn" type="button">Compare saved evidence</button>
++      <button id="compare-pdf" type="button">PDF with differences</button>
++      <button id="compare-csv" type="button">CSV with differences</button>
++      <div id="comparison-results" aria-live="polite">Choose a baseline and current scan.</div>
++    </section>
+   </main>
+ 
+   <!-- Modal -->
+@@ -368,7 +374,7 @@
+     </div>
+   </div>
+ 
+-  <script src="/static/app.js?v=21"></script>
++  <script src="/static/app.js?v=27"></script>
+ 
+   <script>
+     const tabBtns = document.querySelectorAll(".tab-btn");
+diff --git a/scripts/local_lab.py b/scripts/local_lab.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/local_lab.py
+@@ -0,0 +1,38 @@
++"""Owned loopback-only HTTP fixture for the RiskLens demonstration."""
++import argparse
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++import json
++from pathlib import Path
++
++
++def make_handler(state_file):
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            state = json.loads(state_file.read_text(encoding="utf-8-sig")) if state_file.exists() else {}
++            body = b"RiskLens owned localhost lab\n"
++            self.send_response(200 if self.path in {"/", "/docs"} else 404)
++            self.send_header("Content-Type", "text/plain; charset=utf-8")
++            self.send_header("Content-Length", str(len(body)))
++            if state.get("nosniff"):
++                self.send_header("X-Content-Type-Options", "nosniff")
++            self.end_headers()
++            self.wfile.write(body)
++
++        def log_message(self, *args):
++            pass
++    return Handler
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--port", type=int, default=8080)
++    parser.add_argument("--state", type=Path, default=Path("artifacts/lab-state.json"))
++    options = parser.parse_args()
++    server = ThreadingHTTPServer(("127.0.0.1", options.port), make_handler(options.state))
++    print(f"Owned lab: http://127.0.0.1:{options.port}; header state: {options.state}", flush=True)
++    try:
++        server.serve_forever()
++    except KeyboardInterrupt:
++        pass
++    finally:
++        server.server_close()
+diff --git a/scripts/normalize_saved_scans.py b/scripts/normalize_saved_scans.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/normalize_saved_scans.py
+@@ -0,0 +1,25 @@
++"""Explicit offline migration; stop the app first. Never scans or resolves targets."""
++from backend import main
++from backend.snapshots import read_json
++
++
++def main_cli():
++    saved = read_json(main.SCAN_STATUS_FILE) or {}
++    if any(value.get("status") in {"pending", "running", "nmap_done"} for value in saved.values()):
++        raise SystemExit("Active/interrupted jobs exist. Start then stop the backend to reconcile them before migration.")
++    for scan_id, value in saved.items():
++        main.checked_scan_id(scan_id)
++        main.scan_status_store[scan_id] = main.ScanStatus.model_validate(value)
++    for scan_id in main.scan_status_store:
++        if (main.SCANS_DIR / f"snapshot_{scan_id}.json").exists():
++            print(f"{scan_id}: existing snapshot preserved")
++            continue
++        try:
++            snapshot = main.persist_snapshot(scan_id)
++            print(f"{scan_id}: {snapshot['status']}")
++        except (OSError, ValueError) as exc:
++            print(f"{scan_id}: cannot normalize: {exc}")
++
++
++if __name__ == "__main__":
++    main_cli()
+diff --git a/tests/test_comparison.js b/tests/test_comparison.js
+new file mode 100644
+--- /dev/null
++++ b/tests/test_comparison.js
+@@ -0,0 +1,44 @@
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++const elements = new Map();
++const requests = [];
++let responseBody, responseOK = true;
++function element(id) {
++  if (!elements.has(id)) elements.set(id, {value: "", textContent: "", innerHTML: ""});
++  return elements.get(id);
++}
++const context = vm.createContext({
++  document: {addEventListener() {}, getElementById: element},
++  window: {location: {href: ""}},
++  async fetch(url) {requests.push(url); return {ok: responseOK, async json() {return responseBody;}};},
++});
++const source = fs.readFileSync(path.join(__dirname, "../frontend/static/app.js"), "utf8");
++vm.runInContext(source, context);
++(async () => {
++  await vm.runInContext("compareSelectedScans()", context);
++  assert.match(element("comparison-results").textContent, /Select baseline/);
++  element("compare-old").value = "baseline";
++  element("compare-new").value = "current";
++  responseBody = {added: [{component: "http", kind: "security_header", key: "x-content-type-options", before: null, after: "<script>untrusted</script>", reason: "Saved values"}], removed: [], changed: [], uncertain: []};
++  await vm.runInContext("compareSelectedScans()", context);
++  assert.equal(requests[0], "/scans/current/compare/baseline");
++  assert.match(element("comparison-results").innerHTML, /Before/);
++  assert.match(element("comparison-results").innerHTML, /After/);
++  assert.match(element("comparison-results").innerHTML, /&lt;script&gt;/);
++  assert.doesNotMatch(element("comparison-results").innerHTML, /<script>/);
++  responseBody = {added: [], removed: [], changed: [], uncertain: []};
++  await vm.runInContext("compareSelectedScans()", context);
++  assert.match(element("comparison-results").innerHTML, /No comparable exposure changes/);
++  responseOK = false; responseBody = {detail: "Saved target identities differ"};
++  await vm.runInContext("compareSelectedScans()", context);
++  assert.match(element("comparison-results").textContent, /Comparison unavailable: Saved target/);
++  vm.runInContext('exportComparison("pdf")', context);
++  assert.equal(context.window.location.href, "/scan/current/report.pdf?baseline=baseline");
++  const template = fs.readFileSync(path.join(__dirname, "../frontend/templates/index.html"), "utf8");
++  assert.match(template, /data-tab="tab-compare"/);
++  assert.doesNotMatch(template, /(?:src|href)="https?:\/\//);
++  assert.match(source, /network_scan: profile !== "web"/);
++  console.log("PASS: comparison selection, escaped before/after, empty/error states and export links");
++})().catch(error => {console.error(error); process.exitCode = 1;});
+diff --git a/tests/test_local_lab.py b/tests/test_local_lab.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_local_lab.py
+@@ -0,0 +1,57 @@
++"""Real HTTP to an ephemeral 127.0.0.1 fixture; no Nmap/Gobuster or outside targets."""
++from contextlib import ExitStack
++from http.server import ThreadingHTTPServer
++import json
++import os
++from pathlib import Path
++import tempfile
++import threading
++import unittest
++from unittest.mock import patch
++from fastapi.testclient import TestClient
++from backend import main
++from scripts.local_lab import make_handler
++
++
++class LocalLabTest(unittest.TestCase):
++    def test_real_localhost_baseline_change_compare_and_export(self):
++        with ExitStack() as stack:
++            folder = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=".risklens-lab-", dir=Path(__file__).resolve().parents[1])))
++            state_file = folder / "state.json"
++            state_file.write_text('{"nosniff": false}', encoding="utf-8")
++            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state_file))
++            thread = threading.Thread(target=server.serve_forever, daemon=True)
++            thread.start()
++            def stop_server():
++                server.shutdown()
++                server.server_close()
++                thread.join(timeout=5)
++            stack.callback(stop_server)
++            port = server.server_port
++            stack.enter_context(patch.dict(os.environ, {"RISKLENS_ALLOWED_TARGETS": "127.0.0.1/32", "RISKLENS_ALLOWED_WEB_PORTS": str(port)}))
++            stack.enter_context(patch.object(main, "SCANS_DIR", folder))
++            stack.enter_context(patch.object(main, "SCAN_STATUS_FILE", folder / "scan_status.json"))
++            stack.enter_context(patch.object(main, "scan_status_store", {}))
++            stack.enter_context(patch.object(main, "resolve_executable", side_effect=AssertionError("No scanner required")))
++            client = stack.enter_context(TestClient(main.app))
++            def scan():
++                response = client.post("/webscan", json={"url": f"http://127.0.0.1:{port}", "authorized": True})
++                self.assertEqual(response.status_code, 200, response.text)
++                scan_id = response.json()["scan_id"]
++                snap = client.get(f"/scans/{scan_id}/snapshot")
++                self.assertEqual(snap.status_code, 200)
++                self.assertEqual(snap.json()["components"]["http"]["status"], "completed", snap.text)
++                return scan_id
++            baseline = scan()
++            state_file.write_text('{"nosniff": true}', encoding="utf-8")
++            current = scan()
++            result = client.get(f"/scans/{current}/compare/{baseline}")
++            self.assertEqual(result.status_code, 200, result.text)
++            self.assertTrue(any(item["key"] == "x-content-type-options" for item in result.json()["added"]))
++            old_findings = client.get(f"/webscan/{baseline}/findings").json()["findings"]
++            new_findings = client.get(f"/webscan/{current}/findings").json()["findings"]
++            self.assertIn("WEB-HDR-003", [item["id"] for item in old_findings])
++            self.assertNotIn("WEB-HDR-003", [item["id"] for item in new_findings])
++            for suffix in ("report.pdf", "findings.csv"):
++                response = client.get(f"/scan/{current}/{suffix}?baseline={baseline}")
++                self.assertEqual(response.status_code, 200, response.text[:100] if suffix.endswith("csv") else "PDF error")
+diff --git a/tests/test_read_only_endpoints.py b/tests/test_read_only_endpoints.py
+--- a/tests/test_read_only_endpoints.py
++++ b/tests/test_read_only_endpoints.py
+@@ -98,7 +98,7 @@
+         for route in main.app.routes:
+             if "GET" not in (getattr(route, "methods", None) or set()):
+                 continue
+-            path = route.path.replace("{scan_id}", SCAN_ID)
++            path = route.path.replace("{scan_id}", SCAN_ID).replace("{new_id}", SCAN_ID).replace("{old_id}", SCAN_ID)
+             with self.subTest(path=path):
+                 response = self.client.get(path)
+                 self.assertEqual(response.status_code, 200, response.text[:200])
+diff --git a/tests/test_snapshots_comparison.py b/tests/test_snapshots_comparison.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_snapshots_comparison.py
+@@ -0,0 +1,288 @@
++"""Synthetic saved evidence; every API/export is exercised with I/O tripwires."""
++from copy import deepcopy
++import csv
++import io
++import json
++from unittest.mock import patch
++
++import test_read_only_endpoints as fixtures
++from backend import main
++from backend.snapshots import normalize_scan, atomic_json
++from backend.delta_engine import compare_snapshots, IncompatibleScans
++
++OLD = fixtures.SCAN_ID
++NEW = "22222222-2222-4222-8222-222222222222"
++
++
++def snapshot(scan_id=OLD, state="open", version="1.0", header="nosniff"):
++    metadata = {"scan_id": scan_id, "target": "192.0.2.10", "authorized_targets": ["192.0.2.10"],
++                "status": "completed", "created_at": "2026-11-16T12:00:00Z", "completed_at": "2026-11-16T12:01:00Z",
++                "profile": "web", "ports": "80,8080", "nmap_status": "completed", "web_status": "completed",
++                "web_url": "http://192.0.2.10:8080", "gobuster_status": "completed"}
++    observations = [{"host": "192.0.2.10", "protocol": "tcp", "port": 80, "state": state, "service": "http",
++                     "product": "Synthetic", "version": version, "evidence": {"original": {"state": {"@state": state}, "service": {"@name": "http"}}}}]
++    parsed = {"hosts": [{"ip": "192.0.2.10", "state": "up", "services": observations,
++                          "omitted_port_states": ["closed"], "omitted_port_count": 1}], "observations": observations,
++              "coverage": {"run_completed": True, "scanned_ports": {"tcp": [80, 8080]}}}
++    audit = {"url": metadata["web_url"], "status": "completed", "http": {"status": 200,
++             "headers": {"X-Content-Type-Options": header} if header is not None else {}},
++             "tls": {"verification": "not_applicable"}, "checks": []}
++    result = normalize_scan(metadata, parsed, audit, [{"path": "/docs", "status": 200, "size": 10}],
++                            {"status": "completed"}, words=["docs", "help"])
++    result["findings"] = main.build_findings(parsed, audit)
++    return result
++
++
++class SnapshotComparisonTest(fixtures.SavedScanFixture):
++    def pair(self, before=None, after=None):
++        before, after = before or snapshot(), after or snapshot(NEW)
++        atomic_json(self.directory / f"snapshot_{OLD}.json", before)
++        atomic_json(self.directory / f"snapshot_{NEW}.json", after)
++        return before, after
++
++    def test_normalization_preserves_fields_and_original_evidence(self):
++        result = snapshot()
++        self.assertEqual(result["components"]["network"]["status"], "completed")
++        self.assertEqual(result["components"]["http"]["headers"], {"x-content-type-options": "nosniff"})
++        self.assertEqual(result["components"]["tls"]["status"], "not_run")
++        self.assertEqual(result["components"]["paths"]["status"], "completed")
++        self.assertIn("original", result["components"]["network"]["observations"][0]["evidence"])
++        self.assertEqual(result["timestamp"], "2026-11-16T12:01:00Z")
++
++    def test_unknown_legacy_network_completion_is_partial(self):
++        metadata = snapshot()["metadata"]
++        metadata["nmap_status"] = None
++        parsed = snapshot()["components"]["network"]["parsed"]
++        result = normalize_scan(metadata, parsed)
++        self.assertEqual(result["components"]["network"]["status"], "partial")
++
++    def test_completed_label_without_successful_xml_is_not_complete_coverage(self):
++        original = snapshot()
++        parsed = deepcopy(original["components"]["network"]["parsed"])
++        parsed["coverage"]["run_completed"] = False
++        result = normalize_scan(original["metadata"], parsed)
++        self.assertEqual(result["components"]["network"]["status"], "partial")
++
++    def test_web_only_can_complete_with_network_not_run(self):
++        source = snapshot()
++        metadata = {**source["metadata"], "network_scan": False, "nmap_status": "skipped", "gobuster_status": "skipped"}
++        result = normalize_scan(metadata, audit={"url": metadata["web_url"], "http": {"status": 200, "headers": {}}})
++        self.assertEqual(result["status"], "completed")
++        self.assertEqual(result["components"]["network"]["status"], "not_run")
++        self.assertEqual(result["components"]["paths"]["status"], "not_run")
++
++    def test_failed_and_partial_components_are_explicit(self):
++        metadata = {**snapshot()["metadata"], "nmap_status": "failed", "gobuster_status": "timed_out"}
++        result = normalize_scan(metadata, audit={"url": metadata["web_url"], "error": "certificate invalid",
++            "error_category": "certificate_verification_failed", "tls": {"verification": "failed"}},
++            paths=[{"path": "/docs", "status": 200}])
++        self.assertEqual([result["components"][key]["status"] for key in ("network", "http", "tls", "paths")],
++                         ["failed", "failed", "failed", "partial"])
++
++    def test_headers_not_captured_is_not_negative_coverage(self):
++        meta = snapshot()["metadata"]
++        result = normalize_scan(meta, audit={"url": meta["web_url"], "http": {"status": 200}})
++        self.assertEqual(result["components"]["http"]["status"], "partial")
++
++    def test_explicit_closed_to_open_and_open_to_closed(self):
++        old, new = snapshot(state="closed"), snapshot(NEW)
++        result = compare_snapshots(old, new)
++        self.assertTrue(any(item["kind"] == "open_port" for item in result["added"]))
++        result = compare_snapshots(new, old)
++        self.assertTrue(any(item["kind"] == "open_port" for item in result["removed"]))
++
++    def test_filtered_port_is_uncertain_not_removed(self):
++        result = compare_snapshots(snapshot(), snapshot(NEW, state="filtered"))
++        self.assertFalse(result["removed"])
++        self.assertTrue(any(item["kind"] == "open_port" for item in result["uncertain"]))
++
++    def test_nmap_omitted_closed_ports_can_establish_removal(self):
++        old, new = snapshot(), snapshot(NEW)
++        new["components"]["network"]["observations"] = []
++        new["components"]["network"]["hosts"][0]["omitted_port_count"] = 2
++        result = compare_snapshots(old, new)
++        self.assertTrue(any(item["kind"] == "open_port" for item in result["removed"]))
++
++    def test_different_coverage_or_down_host_cannot_establish_removal(self):
++        for change in ("coverage", "down", "count"):
++            old, new = snapshot(), snapshot(NEW)
++            new["components"]["network"]["observations"] = []
++            new["components"]["network"]["hosts"][0]["omitted_port_count"] = 2
++            if change == "coverage":
++                new["components"]["network"]["coverage"]["scanned_ports"] = {"tcp": [8080]}
++            elif change == "down":
++                new["components"]["network"]["hosts"][0]["state"] = "down"
++            else:
++                new["components"]["network"]["hosts"][0]["omitted_port_count"] = 0
++            self.assertFalse(compare_snapshots(old, new)["removed"])
++
++    def test_known_version_changes_and_unknown_version_is_uncertain(self):
++        result = compare_snapshots(snapshot(), snapshot(NEW, version="2.0"))
++        self.assertTrue(any(item["kind"] == "version" for item in result["changed"]))
++        result = compare_snapshots(snapshot(), snapshot(NEW, version=None))
++        self.assertFalse(result["changed"])
++        self.assertTrue(any(item["kind"] == "version" for item in result["uncertain"]))
++
++    def test_header_added_removed_changed(self):
++        self.assertTrue(compare_snapshots(snapshot(header=None), snapshot(NEW))["added"])
++        self.assertTrue(compare_snapshots(snapshot(), snapshot(NEW, header=None))["removed"])
++        self.assertTrue(compare_snapshots(snapshot(header="wrong"), snapshot(NEW))["changed"])
++
++    def test_failed_http_cannot_remove_headers(self):
++        old, new = snapshot(), snapshot(NEW, header=None)
++        new["components"]["http"]["status"] = "failed"
++        result = compare_snapshots(old, new)
++        self.assertFalse(result["removed"])
++        self.assertTrue(result["uncertain"])
++
++    def test_different_response_status_makes_header_changes_uncertain(self):
++        old, new = snapshot(), snapshot(NEW, header=None)
++        new["components"]["http"]["response"]["status"] = 302
++        self.assertFalse(compare_snapshots(old, new)["removed"])
++
++    def test_tls_metadata_changes_require_verified_coverage(self):
++        old, new = snapshot(), snapshot(NEW)
++        for item in (old, new):
++            item["components"]["tls"].update(status="completed", details={"verification": "verified", "protocol": "TLSv1.3", "certificate_sha256": "aaa"})
++        new["components"]["tls"]["details"]["certificate_sha256"] = "bbb"
++        self.assertTrue(any(item["component"] == "tls" for item in compare_snapshots(old, new)["changed"]))
++        new["components"]["tls"]["status"] = "failed"
++        self.assertFalse(compare_snapshots(old, new)["changed"])
++
++    def test_path_added_removed_status_and_mismatched_wordlists(self):
++        old, new = snapshot(), snapshot(NEW)
++        new["components"]["paths"]["observations"] = [{"path": "/help", "status": 200}]
++        result = compare_snapshots(old, new)
++        self.assertTrue(result["added"])
++        self.assertTrue(result["removed"])
++        new["components"]["paths"]["coverage"]["words"] = ["help"]
++        result = compare_snapshots(old, new)
++        self.assertFalse(result["added"] or result["removed"])
++        self.assertTrue(result["uncertain"])
++
++    def test_failed_new_network_never_marks_closed_port_removed(self):
++        old, new = snapshot(), snapshot(NEW, state="closed")
++        new["components"]["network"]["status"] = "partial"
++        self.assertFalse(compare_snapshots(old, new)["removed"])
++
++    def test_api_uses_saved_snapshots_without_processes_or_requests(self):
++        self.pair(after=snapshot(NEW, header="wrong"))
++        result = self.client.get(f"/scans/{NEW}/compare/{OLD}")
++        self.assertEqual(result.status_code, 200, result.text)
++        self.assertTrue(result.json()["changed"])
++        self.assert_no_external_io()
++
++    def test_api_ids_missing_corrupt_and_active_scans(self):
++        self.pair()
++        self.assertEqual(self.client.get(f"/scans/bad/compare/{OLD}").status_code, 400)
++        missing = "33333333-3333-4333-8333-333333333333"
++        self.assertEqual(self.client.get(f"/scans/{missing}/compare/{OLD}").status_code, 404)
++        current = snapshot(NEW)
++        current["metadata"]["status"] = "running"
++        atomic_json(self.directory / f"snapshot_{NEW}.json", current)
++        self.assertEqual(self.client.get(f"/scans/{NEW}/compare/{OLD}").status_code, 409)
++        (self.directory / f"snapshot_{NEW}.json").write_text("{bad")
++        self.assertEqual(self.client.get(f"/scans/{NEW}/compare/{OLD}").status_code, 422)
++        current = snapshot(NEW)
++        current.pop("metadata")
++        atomic_json(self.directory / f"snapshot_{NEW}.json", current)
++        self.assertEqual(self.client.get(f"/scans/{NEW}/compare/{OLD}").status_code, 422)
++        self.assert_no_external_io()
++
++    def test_api_rejects_target_or_web_port_mismatch(self):
++        for change in ("target", "origin"):
++            old, new = snapshot(), snapshot(NEW)
++            if change == "target":
++                new["identity"]["targets"] = ["192.0.2.11"]
++            else:
++                new["identity"]["web_origin"]["port"] = 8443
++            self.pair(old, new)
++            self.assertEqual(self.client.get(f"/scans/{NEW}/compare/{OLD}").status_code, 409)
++        self.assert_no_external_io()
++
++    def test_different_requested_cidrs_cannot_share_identity_from_alive_hosts(self):
++        old, new = snapshot(), snapshot(NEW)
++        new["identity"]["target_key"] = "192.0.2.0/24"
++        with self.assertRaises(IncompatibleScans):
++            compare_snapshots(old, new)
++
++    def test_unrequested_paths_stay_not_run_after_http_failure(self):
++        result = normalize_scan(snapshot()["metadata"], audit={"url": "http://192.0.2.10:8080", "error": "read timeout"},
++                                path_record={"enabled": False, "status": "failed"})
++        self.assertEqual(result["components"]["paths"]["status"], "not_run")
++
++    def test_zero_exit_with_gobuster_request_errors_is_incomplete(self):
++        from backend.scanner.path_discovery import execute_discovery
++        from unittest.mock import Mock
++        import threading
++        from backend.scanner import path_discovery
++        process = Mock()
++        process.poll.return_value = 0
++        process.wait.return_value = 0
++        def launch(command, **kwargs):
++            kwargs["stderr"].write(b"[ERROR] synthetic request timeout")
++            kwargs["stderr"].flush()
++            return process
++        with patch.object(path_discovery.subprocess, "Popen", side_effect=launch):
++            with self.assertRaisesRegex(RuntimeError, "uncertain coverage"):
++                execute_discovery("mock.exe", "http://192.0.2.10", self.directory / "words", self.directory / "paths.txt", threading.Event(), lambda: None)
++        self.assert_no_external_io()
++
++    def test_get_legacy_snapshot_does_not_write_files(self):
++        before = set(self.directory.iterdir())
++        self.assertEqual(self.client.get(f"/scans/{OLD}/snapshot").status_code, 200)
++        self.assertEqual(before, set(self.directory.iterdir()))
++        self.assert_no_external_io()
++
++    def test_persisted_findings_are_identical_in_ui_csv_pdf_and_web_api(self):
++        old, new = self.pair()
++        finding = {"id": "WEB-TEST", "rule_id": "WEB-TEST", "title": "Synthetic saved finding", "domain": "web",
++                   "category": "configuration_observation", "severity": "info", "confidence": "high", "asset": new["target"],
++                   "source": "Saved test evidence", "evidence": "UniqueSavedEvidence", "remediation": "UniqueRemediation", "retest": "UniqueRetest"}
++        new["findings"] = [finding]
++        atomic_json(self.directory / f"snapshot_{NEW}.json", new)
++        with patch.object(main, "build_findings", side_effect=AssertionError("Must not recalculate saved findings")):
++            self.assertEqual(self.client.get(f"/scan/{NEW}/findings").json()["findings"], [finding])
++            self.assertEqual(self.client.get(f"/webscan/{NEW}/findings").json()["findings"], [finding])
++            csv_response = self.client.get(f"/scan/{NEW}/findings.csv")
++            row = list(csv.DictReader(io.StringIO(csv_response.text)))[0]
++            for key in ("evidence", "severity", "confidence", "remediation", "retest"):
++                self.assertEqual(row[key], finding[key])
++            pdf = self.client.get(f"/scan/{NEW}/report.pdf")
++            self.assertEqual(pdf.status_code, 200)
++            self.assertTrue(pdf.content.startswith(b"%PDF-"))
++            for value in (b"UniqueSavedEvidence", b"UniqueRemediation", b"UniqueRetest", b"Network findings", b"Web configuration"):
++                self.assertIn(value, pdf.content)
++        self.assert_no_external_io()
++
++    def test_report_optional_differences_are_same_as_comparison_api(self):
++        self.pair(after=snapshot(NEW, header="wrong"))
++        expected = self.client.get(f"/scans/{NEW}/compare/{OLD}").json()
++        original = main.build_pdf_report
++        with patch.object(main, "build_pdf_report", wraps=original) as pdf_builder:
++            response = self.client.get(f"/scan/{NEW}/report.pdf?baseline={OLD}")
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(pdf_builder.call_args.kwargs["differences"], expected)
++        csv_report = self.client.get(f"/scan/{NEW}/findings.csv?baseline={OLD}")
++        rows = list(csv.DictReader(io.StringIO(csv_report.text)))
++        self.assertTrue(any(row["record_type"] == "difference" and row["title"] == "security_header" for row in rows))
++        self.assert_no_external_io()
++
++    def test_independent_web_works_without_nmap_and_saves_snapshot(self):
++        audit = {"url": "http://127.0.0.1:8080", "http": {"status": 200, "headers": {}}, "checks": [], "tls": {}}
++        with patch.object(main, "resolve_executable", side_effect=AssertionError("Nmap/Gobuster must not be required")), patch.object(main, "run_web_security_assessment", return_value=audit):
++            response = self.client.post("/webscan", json={"url": audit["url"], "authorized": True})
++        self.assertEqual(response.status_code, 200, response.text)
++        scan_id = response.json()["scan_id"]
++        saved = self.client.get(f"/scans/{scan_id}/snapshot").json()
++        self.assertEqual(saved["components"]["network"]["status"], "not_run")
++        self.assertEqual(saved["components"]["http"]["status"], "completed")
++        self.assertTrue((self.directory / f"snapshot_{scan_id}.json").exists())
++        self.assertEqual(self.client.get(f"/scan/{scan_id}/report.pdf").status_code, 200)
++        self.assert_no_external_io()
++
++    def test_independent_web_requires_authorization_and_scope(self):
++        for body, expected in (({"url": "http://127.0.0.1:8080"}, 403),
++                               ({"url": "http://198.51.100.1:8080", "authorized": True}, 403)):
++            self.assertEqual(self.client.post("/webscan", json=body).status_code, expected)
++        self.assert_no_external_io()

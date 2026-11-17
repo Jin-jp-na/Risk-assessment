@@ -1,0 +1,1944 @@
+diff --git a/backend/main.py b/backend/main.py
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -14,16 +14,19 @@
+ import requests
+ from urllib.parse import urlparse
+ from pathlib import Path
+-from pydantic import BaseModel
++from pydantic import BaseModel, Field
++from backend.scanner.scan_policy import (
++    ConfigurationError, ScopeError, PROFILES, validate_request, validate_targets,
++    normalize_ports, resolve_executable, nmap_command,
++)
+ from backend.scanner.pcvp_scoring import pcvp_score_for_service
+ from backend.scanner.attack_graph import build_attack_graph
+ from starlette.responses import StreamingResponse, Response
+ from backend.report_generator import build_pdf_report
+ from io import BytesIO
+ import io
+-import re
+-from typing import Tuple
+-import time 
++import os
++import threading
+ from datetime import datetime, timezone
+ 
+ 
+@@ -37,46 +40,15 @@
+     except ValueError:
+         return "external"
+ 
+-NMAP_PATH = r"C:\Program Files (x86)\Nmap\nmap.exe"
+-IPSCAN_PATH = r"C:\Tools\AngryIP\ipscan.exe"  # add here
+ 
+ BASE_DIR = Path(__file__).resolve().parent
+ SCANS_DIR = BASE_DIR / "scans"
+ SCANS_DIR.mkdir(exist_ok=True)
+ SCAN_STATUS_FILE = SCANS_DIR / "scan_status.json"
+-
+-def parse_target_and_port(raw: str) -> Tuple[str, Optional[str], Optional[str]]:
+-    """
+-    Returns (host, port, scheme)
+-    Accepts:
+-      - "1.2.3.4"
+-      - "1.2.3.4:3000"
+-      - "example.com:8080"
+-      - "http://example.com:8080"
+-      - "https://example.com:8443"
+-    Note: IPv6 like [::1]:3000 not handled here (can be added).
+-    """
+-    raw = (raw or "").strip()
+-    scheme = None
+-    hostport = raw
+-
+-    m = re.match(r"^(https?)://([^/]+)", raw, flags=re.IGNORECASE)
+-    if m:
+-        scheme = m.group(1).lower()
+-        hostport = m.group(2)
+-
+-    if ":" in hostport and hostport.count(":") == 1:
+-        host, port = hostport.split(":", 1)
+-        host = host.strip()
+-        port = port.strip()
+-        if port.isdigit():
+-            return host, port, scheme
+-
+-    return hostport.strip(), None, scheme
+-
+-GOBUSTER_EXE = BASE_DIR.parent / "gobuster_Windows_x86_64" / "gobuster.exe"
+ GOBUSTER_WORDLIST = BASE_DIR.parent / "wordlists" / "common.txt"
+-NMAP_SCRIPT_SET = "vuln"
++
++STATUS_LOCK = threading.RLock()
++SCAN_SLOTS = threading.BoundedSemaphore(1)
+ 
+ BOOT_ID = str(uuid4())
+ 
+@@ -89,6 +61,7 @@
+     exposure: Optional[str] = "auto"
+     ports: Optional[str] = None
+     profile: str = "standard"
++    authorized: bool = False
+ 
+ class ScanStatus(BaseModel):
+     scan_id: str
+@@ -102,6 +75,12 @@
+     description: Optional[str] = None
+     created_at: str = ""
+     completed_at: Optional[str] = None
++    ports: Optional[str] = None
++    authorized_targets: list[str] = Field(default_factory=list)
++    approved_scope: list[str] = Field(default_factory=list)
++    authorized: bool = False
++    nmap_status: Optional[str] = None
++    nmap_exit_code: Optional[int] = None
+ 
+ 
+ class WebScanRequest(BaseModel):
+@@ -126,217 +105,142 @@
+         return
+     try:
+         data = json.loads(SCAN_STATUS_FILE.read_text(encoding="utf-8"))
++        interrupted = False
+         for scan_id, raw_status in data.items():
+             status = ScanStatus.model_validate(raw_status)
+             if not status.created_at:
+                 status.created_at = _utc_now()
++            if status.status in {"pending", "running", "nmap_done"}:
++                interrupted = True
++                status.status = "failed"
++                status.message = "Interrupted by server restart; no automatic scan was resumed."
++                status.completed_at = _utc_now()
++                if status.nmap_status != "completed":
++                    status.nmap_status = "failed"
++                if status.gobuster_status in {"pending", "running"}:
++                    status.gobuster_status = "skipped" if status.nmap_status == "failed" else "failed"
+             scan_status_store[scan_id] = status
++        if interrupted:
++            _save_scan_status_store()
+     except (OSError, json.JSONDecodeError, ValueError) as exc:
+         print(f"[SCAN STORE] Failed to load scan status store: {exc}")
+ 
+ def _save_scan_status_store() -> None:
+-    try:
++    with STATUS_LOCK:
+         data = {k: v.model_dump() for k, v in scan_status_store.items()}
+         tmp = SCAN_STATUS_FILE.with_suffix(".tmp")
+-        with tmp.open("w", encoding="utf-8") as f:
+-            json.dump(data, f, indent=2)
++        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+         tmp.replace(SCAN_STATUS_FILE)
+-    except Exception as e:
+-        print(f"[SCAN STORE] Failed to save scan status store: {e}")
+-
+-def is_cidr_target(s: str) -> bool:
+-    try:
+-        ipaddress.ip_network(s, strict=False)
+-        return "/" in s
+-    except Exception:
+-        return False
+-
+-
+-def run_angry_ip_discovery(scan_id: str, subnet: str) -> list[str]:
+-    out_csv = SCANS_DIR / f"angryip_{scan_id}.csv"
+-
+-    # Convert CIDR -> start/end range for Angry IP feeder
+-    net = ipaddress.ip_network(subnet, strict=False)
+-    start_ip = str(net.network_address)
+-    end_ip = str(net.broadcast_address)
+-
+-    cmd = [
+-        IPSCAN_PATH,
+-        "-s",                  # start scanning automatically
+-        "-q",                  # quit after exporting the results
+-        "-f:range", start_ip, end_ip,
+-        "-o", str(out_csv),    # exporter inferred from ".csv"
+-    ]
+-
+-    startupinfo = subprocess.STARTUPINFO()
+-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+-    startupinfo.wShowWindow = subprocess.SW_HIDE
+-
+-    result = subprocess.run(
+-        cmd,
+-        capture_output=True,
+-        text=True,
+-        timeout=300,
+-        creationflags=subprocess.CREATE_NO_WINDOW,  #  hide Angry IP window
+-        startupinfo=startupinfo,
+-    )
+-
+-    if result.returncode != 0:
+-        err = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
+-        raise Exception(f"Angry IP Scanner failed: {err or 'unknown error'}")
+-
+-    if not out_csv.exists():
+-        return []
+-
+-    alive: list[str] = []
+-    with out_csv.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+-        reader = csv.reader(f)
+-        for row in reader:
+-            if not row:
+-                continue
+-            candidate = (row[0] or "").strip()
+-            try:
+-                ipaddress.ip_address(candidate)
+-                alive.append(candidate)
+-            except Exception:
+-                continue
+-
+-    return sorted(set(alive), key=lambda x: tuple(int(p) for p in x.split(".")))
+ 
+ 
+ def run_nmap_scan_multi(scan_id: str, targets: List[str], ports: Optional[str] = None) -> None:
+-    """
+-    Runs ONE Nmap scan for multiple targets and writes:
+-      scans/<scan_id>.xml
+-
+-    Uses a temporary file first to avoid partial XML reads.
+-    """
+     status = scan_status_store.get(scan_id)
+-    if not status:
++    if status is None:
+         return
+-
++    output = SCANS_DIR / f"{scan_id}.xml"
++    temporary = SCANS_DIR / f"{scan_id}.xml.tmp"
++    record_path = SCANS_DIR / f"nmap_{scan_id}.json"
++    record = {"scan_id": scan_id, "profile": status.profile, "started_at": _utc_now(),
++              "exit_code": None, "stderr": "", "command": [], "xml": None}
+     status.status = "running"
+-    status.message = "Nmap scan in progress (multi-host)..."
+-    status.gobuster_status = "skipped"
+-    scan_status_store[scan_id] = status
+-    _save_scan_status_store()
+-
+-    output_file = SCANS_DIR / f"{scan_id}.xml"
+-    tmp_file = SCANS_DIR / f"{scan_id}.xml.tmp"
+-
+-    try:
+-        # Remove any stale tmp
++    status.nmap_status = "running"
++    status.message = "Nmap scan in progress."
++    try:
++        _save_scan_status_store()
++        if not status.authorized:
++            raise ScopeError("No recorded authorization for this scan")
++        targets = validate_targets(targets, status.approved_scope)
++        if targets != status.authorized_targets:
++            raise ScopeError("Worker targets do not match the saved authorized target list")
++        ports = normalize_ports(ports, status.profile)
++        if ports != status.ports:
++            raise ScopeError("Worker ports do not match the saved scan request")
++        executable = resolve_executable("RISKLENS_NMAP_PATH", "nmap")
++        command = nmap_command(executable, targets, status.profile, ports, temporary)
++        timeout = PROFILES[status.profile]["timeout"]
++        record.update(command=command, timeout_seconds=timeout, targets=targets, ports=ports,
++                      approved_scope=status.approved_scope, authorized=status.authorized)
++        result = subprocess.run(command, shell=False, capture_output=True, text=True,
++                                encoding="utf-8", errors="replace", timeout=timeout,
++                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
++        status.nmap_exit_code = result.returncode
++        record.update(exit_code=result.returncode, stderr=(result.stderr or "")[-2000:])
++        if result.returncode != 0:
++            raise RuntimeError(f"Nmap exited with code {result.returncode}: {(result.stderr or result.stdout or 'No diagnostic output')[-2000:]}")
++        if not temporary.is_file() or temporary.stat().st_size > 16 * 1024 * 1024:
++            raise ValueError("Nmap XML missing or exceeds 16 MiB")
++        parsed_xml = xmltodict.parse(temporary.read_text(encoding="utf-8"), disable_entities=True)
++        root = parsed_xml.get("nmaprun")
++        if not isinstance(root, dict) or (root.get("runstats") or {}).get("finished", {}).get("@exit") != "success":
++            raise ValueError("Nmap did not produce a successful, complete XML artifact")
++        hosts = root.get("host", [])
++        hosts = [hosts] if isinstance(hosts, dict) else hosts
++        seen = set()
++        for host in hosts:
++            if host.get("@timedout") == "true":
++                raise ValueError("Nmap host timeout: coverage is incomplete")
++            addresses = host.get("address", [])
++            addresses = [addresses] if isinstance(addresses, dict) else addresses
++            for address in addresses:
++                if address.get("@addrtype") in {"ipv4", "ipv6"}:
++                    seen.add(str(ipaddress.ip_address(address["@addr"])))
++            reported_ports = (host.get("ports") or {}).get("port", [])
++            reported_ports = [reported_ports] if isinstance(reported_ports, dict) else reported_ports
++            requested_ports = set(ports.split(",")) if ports else None
++            if len(reported_ports) > PROFILES[status.profile]["top_ports"]:
++                raise ValueError("Nmap XML reports more ports than the selected profile allows")
++            for port in reported_ports:
++                if port.get("@protocol") != "tcp" or (requested_ports is not None and port.get("@portid") not in requested_ports):
++                    raise ValueError("Nmap XML contains ports outside the requested TCP coverage")
++        if not seen.issubset(set(targets)):
++            raise ScopeError("Nmap XML contains an address outside the submitted targets")
++        if not seen.issuperset(targets):
++            raise ValueError("Nmap XML omits requested hosts; coverage is incomplete")
++        # Preserve the standard final filename; readers never see partially written XML.
++        temporary.replace(output)
++        record["xml"] = output.name
++        status.nmap_status = "completed"
++        status.status = "completed" if status.gobuster_status == "skipped" else "nmap_done"
++        status.message = "Nmap scan completed." if status.status == "completed" else "Nmap completed; web assessment pending."
++        if status.status == "completed":
++            status.completed_at = _utc_now()
++        if "/" in status.target:
++            alive = [str(ipaddress.ip_address(a["@addr"])) for host in hosts
++                     if (host.get("status") or {}).get("@state") == "up"
++                     for a in ([host["address"]] if isinstance(host.get("address"), dict) else host.get("address", []))
++                     if a.get("@addrtype") in {"ipv4", "ipv6"}]
++            (SCANS_DIR / f"alive_{scan_id}.json").write_text(
++                json.dumps({"subnet": status.target, "alive": alive}, indent=2), encoding="utf-8")
++    except Exception as exc:
++        if isinstance(exc, subprocess.TimeoutExpired):
++            message = f"Nmap process timed out after {exc.timeout} seconds."
++            record["timed_out"] = True
++            record["stderr"] = str(exc.stderr or "")[-2000:]
++        else:
++            message = str(exc)
++        status.status = "failed"
++        status.nmap_status = "failed"
++        status.message = message[:2500]
++        status.completed_at = _utc_now()
++        if temporary.exists():
++            partial = SCANS_DIR / f"{scan_id}.xml.partial"
++            temporary.replace(partial)
++            record["partial_xml"] = partial.name
++    finally:
++        record.update(status=status.nmap_status, message=status.message, completed_at=_utc_now())
+         try:
+-            if tmp_file.exists():
+-                tmp_file.unlink()
+-        except Exception:
+-            pass
+-
+-        cmd = [NMAP_PATH, "-sV", "-O", "--osscan-guess", "-T4", "-Pn", "--script", NMAP_SCRIPT_SET]
+-
+-        if ports:
+-            cmd += ["-p", ports]
+-
+-        # ✅ Write to tmp first
+-        cmd += ["-oX", str(tmp_file)]
+-        cmd += list(targets)
+-
+-        try:
+-            subprocess.run(cmd, check=True, capture_output=True)
+-        except subprocess.CalledProcessError:
+-            # OS detection may require an elevated Nmap installation. Preserve
+-            # the service/vulnerability scan if Windows blocks raw probes.
+-            fallback = [arg for arg in cmd if arg not in ("-O", "--osscan-guess")]
+-            subprocess.run(fallback, check=True, capture_output=True)
+-
+-        #  Atomic replace: endpoints will only see a complete XML
+-        if not tmp_file.exists() or tmp_file.stat().st_size < 100:
+-            raise RuntimeError("Nmap did not produce a valid XML output file.")
+-
+-        tmp_file.replace(output_file)
+-
+-        status.status = "completed"
+-        status.message = f"CIDR scan completed. Alive hosts scanned: {len(targets)}"
+-
+-    except subprocess.CalledProcessError as e:
+-        err_msg = ""
+-        try:
+-            err_msg = e.stderr.decode(errors="ignore") if e.stderr else ""
+-        except Exception:
+-            err_msg = str(e)
+-
+-        status.status = "failed"
+-        status.message = f"Scan failed: {err_msg or str(e)}"
+-
+-    except Exception as e:
+-        status.status = "failed"
+-        status.message = f"Unexpected error: {e}"
+-
+-    finally:
+-        scan_status_store[scan_id] = status
+-        _save_scan_status_store()
+-        # cleanup tmp if left behind
+-        try:
+-            if tmp_file.exists():
+-                tmp_file.unlink()
+-        except Exception:
+-            pass
+-
+-
+-def run_cidr_scan(
+-    scan_id: str,
+-    subnet: str,
+-    ports: Optional[str],
+-) -> None:
+-    """
+-    1) Angry IP discovery -> alive hosts
+-    2) Run ONE combined Nmap scan against alive hosts
+-       and write scans/<scan_id>.xml (so your existing UI endpoints work)
+-
+-    Also saves alive list:
+-      scans/alive_<scan_id>.json
+-    """
+-    st = scan_status_store.get(scan_id)
+-    if not st:
+-        return
+-
+-    try:
+-        st.status = "running"
+-        st.message = "Discovering alive hosts (Angry IP Scanner)..."
+-        st.gobuster_status = "skipped"
+-        scan_status_store[scan_id] = st
+-        _save_scan_status_store()
+-
+-        alive_hosts = run_angry_ip_discovery(scan_id, subnet)
+-
+-        if not alive_hosts:
+-            st.status = "failed"
+-            st.message = "No alive hosts found in subnet."
+-            scan_status_store[scan_id] = st
++            record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+             _save_scan_status_store()
+-            return
+-
+-        # save alive list
+-        alive_path = SCANS_DIR / f"alive_{scan_id}.json"
+-        with alive_path.open("w", encoding="utf-8") as f:
+-            json.dump({"subnet": subnet, "alive": alive_hosts}, f, indent=2)
+-
+-        st.message = f"Discovered {len(alive_hosts)} alive hosts. Running Nmap (combined)..."
+-        scan_status_store[scan_id] = st
+-        _save_scan_status_store()
+-
+-        # IMPORTANT: run one Nmap scan for all alive hosts -> scans/<scan_id>.xml
+-        run_nmap_scan_multi(scan_id, alive_hosts, ports=ports)
+-
+-        # run_nmap_scan_multi updates scan status to completed/failed and saves it
+-        return
+-
+-    except Exception as e:
+-        st.status = "failed"
+-        st.message = f"CIDR scan failed: {e}"
+-        st.gobuster_status = "skipped"
+-        scan_status_store[scan_id] = st
+-        _save_scan_status_store()
++        except OSError as exc:
++            status.status = "failed"
++            status.message = f"Cannot persist scan artifacts: {exc}"
++
++
++def run_cidr_scan(scan_id: str, subnet: str, ports: Optional[str]) -> None:
++    status = scan_status_store.get(scan_id)
++    if status is not None:
++        run_nmap_scan_multi(scan_id, status.authorized_targets, ports)
++
+ 
+ def _normalize_webscan_error(err: str) -> str:
+     e = (err or "").strip()
+@@ -365,6 +269,7 @@
+     parsed_url = urlparse(url)
+     if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
+         return {"url": url, "error": "Unsupported web URL."}
++    validate_targets([parsed_url.hostname])
+ 
+     result = {
+         "url": url,
+@@ -377,13 +282,9 @@
+     response = None
+     request_error = None
+     try:
+-        response = requests.get(url, timeout=15, allow_redirects=True, verify=True)
+-    except requests.exceptions.SSLError as exc:
+-        request_error = str(exc)
+-        try:
+-            response = requests.get(url, timeout=15, allow_redirects=True, verify=False)
+-        except requests.RequestException as fallback_exc:
+-            request_error = str(fallback_exc)
++        with requests.Session() as session:
++            session.trust_env = False
++            response = session.get(url, timeout=15, allow_redirects=False, verify=True)
+     except requests.RequestException as exc:
+         request_error = str(exc)
+ 
+@@ -478,11 +379,14 @@
+ @app.post("/scans/clear")
+ def clear_persisted_scans():
+     try:
+-        if SCAN_STATUS_FILE.exists():
+-            SCAN_STATUS_FILE.unlink()
+-        scan_status_store.clear()
+-        _save_scan_status_store()
++        with STATUS_LOCK:
++            if any(status.status in {"pending", "running", "nmap_done"} for status in scan_status_store.values()):
++                raise HTTPException(status_code=409, detail="Cannot clear history while a scan is active")
++            scan_status_store.clear()
++            _save_scan_status_store()
+         return {"status": "ok", "message": "Persisted scan metadata cleared (raw files preserved)"}
++    except HTTPException:
++        raise
+     except Exception as e:
+         raise HTTPException(status_code=500, detail=f"Failed to clear scan metadata: {e}")
+ 
+@@ -502,181 +406,87 @@
+ 
+ 
+ def run_nmap_scan(scan_id: str, target: str, ports: Optional[str] = None):
+-    status = scan_status_store.get(scan_id)
+-    if not status:
+-        return
+-
+-    status.status = "running"
+-    scan_status_store[scan_id] = status
+-
+-    output_file = SCANS_DIR / f"{scan_id}.xml"
+-
+-    try:
+-        profile = status.profile
+-        cmd = [
+-            NMAP_PATH,
+-            "-sV",
+-            "-T4",
+-            "-Pn",
+-        ]
+-        if profile in {"vulnerability", "full"}:
+-            cmd += ["-O", "--osscan-guess", "--script", NMAP_SCRIPT_SET]
+-        elif profile == "quick":
+-            cmd = [NMAP_PATH, "-T4", "-Pn"]
+-
+-        if ports:
+-            cmd += ["-p", ports]  # ✅ only scan specified ports
+-
+-        cmd += ["-oX", str(output_file), target]
+-
+-        try:
+-            subprocess.run(cmd, check=True, capture_output=True)
+-        except subprocess.CalledProcessError:
+-            fallback = [arg for arg in cmd if arg not in ("-O", "--osscan-guess")]
+-            subprocess.run(fallback, check=True, capture_output=True)
+-
+-        status.status = "nmap_done"
+-        status.message = "Nmap completed. Waiting for Gobuster..."
+-
+-    except subprocess.CalledProcessError as e:
+-        err_msg = e.stderr.decode(errors="ignore") if e.stderr else str(e)
+-        status.status = "failed"
+-        status.message = f"Scan failed: {err_msg}"
+-    except Exception as e:
+-        status.status = "failed"
+-        status.message = f"Unexpected error: {e}"
++    run_nmap_scan_multi(scan_id, [target], ports)
++
++
++def run_scan_job(scan_id: str, web_url: Optional[str] = None) -> None:
++    try:
++        status = scan_status_store[scan_id]
++        if "/" in status.target:
++            run_cidr_scan(scan_id, status.target, status.ports)
++        else:
++            run_nmap_scan(scan_id, status.target, status.ports)
++        if status.nmap_status == "failed" and web_url:
++            status.gobuster_status = "skipped"
++            _save_scan_status_store()
++        if status.nmap_status == "completed" and web_url:
++            run_gobuster_scan(scan_id, web_url)
++            status.status = "failed" if status.gobuster_status == "failed" else "completed"
++            status.message = "Network completed; web assessment failed." if status.status == "failed" else "Network and web assessments completed."
++            status.completed_at = _utc_now()
++            _save_scan_status_store()
++    except Exception as exc:
++        status = scan_status_store.get(scan_id)
++        if status is not None:
++            status.status = "failed"
++            status.message = f"Scan job failed: {exc}"[:2500]
++            status.completed_at = _utc_now()
++            _save_scan_status_store()
+     finally:
+-        scan_status_store[scan_id] = status
+-        _save_scan_status_store()
++        SCAN_SLOTS.release()
++
+ 
+ @app.post("/scan", response_model=ScanStatus)
+ def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
+-    if not request.target:
+-        raise HTTPException(status_code=400, detail="Target is required")
+-    try:
+-        ip_tmp = ipaddress.ip_address(request.target.strip())
+-        if ip_tmp.version == 4 and request.target.strip().endswith(".0"):
+-            request.target = f"{request.target.strip()}/24"
++    if not request.authorized:
++        raise HTTPException(status_code=403, detail="Explicit authorization acknowledgement is required")
++    if request.exposure not in {None, "auto", "internal", "external"}:
++        raise HTTPException(status_code=400, detail="Exposure must be auto, internal, or external")
++    try:
++        plan = validate_request(request.target, request.ports, request.profile)
++        resolve_executable("RISKLENS_NMAP_PATH", "nmap")
++        if plan["web_url"]:
++            resolve_executable("RISKLENS_GOBUSTER_PATH", "gobuster")
++            if not GOBUSTER_WORDLIST.is_file():
++                raise ConfigurationError("Gobuster wordlist is missing")
++    except ScopeError as exc:
++        raise HTTPException(status_code=403, detail=str(exc))
++    except ConfigurationError as exc:
++        raise HTTPException(status_code=503, detail=str(exc))
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc))
++    if not SCAN_SLOTS.acquire(blocking=False):
++        raise HTTPException(status_code=409, detail="A scan is already active; wait for completion")
++    scan_id = str(uuid4())
++    try:
++        exposure = request.exposure or "auto"
++        status = ScanStatus(
++            scan_id=scan_id, target=plan["target"], status="pending", message="Authorized scan scheduled.",
++            exposure=exposure, exposure_effective=(infer_exposure_from_target(plan["targets"][0]) if exposure == "auto" else exposure),
++            gobuster_status="pending" if plan["web_url"] else "skipped", profile=request.profile,
++            description=request.description, created_at=_utc_now(), ports=plan["ports"],
++            authorized_targets=plan["targets"], approved_scope=plan["scope"], nmap_status="pending",
++            authorized=True,
++        )
++        with STATUS_LOCK:
++            scan_status_store[scan_id] = status
++            _save_scan_status_store()
++        background_tasks.add_task(run_scan_job, scan_id, plan["web_url"])
+     except Exception:
+-        pass
+-
+-    # ADD THIS (CIDR subnet scan)
+-    if is_cidr_target(request.target):
+-        scan_id = str(uuid4())
+-        ports = (request.ports or "").strip() or None
+-
+-        profile = request.profile if request.profile in {"quick", "standard", "vulnerability", "web", "full"} else "standard"
+-        status = ScanStatus(
+-            scan_id=scan_id,
+-            target=request.target,  # keep CIDR as target label
+-            status="pending",
+-            message="CIDR scan scheduled (Angry IP discovery + combined Nmap)",
+-            exposure=request.exposure or "auto",
+-            exposure_effective="internal",
+-            gobuster_status="skipped",
+-            profile=profile,
+-            description=request.description,
+-            created_at=_utc_now(),
+-        )
+-        scan_status_store[scan_id] = status
+-        _save_scan_status_store()
+-
+-        background_tasks.add_task(run_cidr_scan, scan_id, request.target, ports)
+-        return status
+-    #  END CIDR BLOCK
+-
+-    host, implied_port, scheme = parse_target_and_port(request.target)
+-
+-    # user-provided ports (optional)
+-    ports = (request.ports or "").strip() or None
+-
+-    # if user typed host:port and didn't provide ports separately, use that
+-    if implied_port and not ports:
+-        ports = implied_port
+-
+-    exposure_choice = request.exposure or "auto"
+-    if exposure_choice == "auto":
+-        exposure_effective = infer_exposure_from_target(host)
+-    else:
+-        exposure_effective = exposure_choice
+-
+-    scan_id = str(uuid4())
+-    profile = request.profile if request.profile in {"quick", "standard", "vulnerability", "web", "full"} else "standard"
+-    status = ScanStatus(
+-        scan_id=scan_id,
+-        target=host,  #  store clean host (not host:port)
+-        status="pending",
+-        message="Nmap + Gobuster scan scheduled",
+-        exposure=exposure_choice,
+-        exposure_effective=exposure_effective,
+-        profile=profile,
+-        description=request.description,
+-        created_at=_utc_now(),
+-    )
+-    scan_status_store[scan_id] = status
+-    _save_scan_status_store()
+-
+-    #  Nmap: scan host, optionally specific ports
+-    background_tasks.add_task(run_nmap_scan, scan_id=scan_id, target=host, ports=ports)
+-
+-    # Gobuster: build URL including scheme and port (if single port)
+-    netloc = host
+-    if ports and ports.isdigit():
+-        netloc = f"{host}:{ports}"
+-
+-    if not scheme:
+-        scheme = "http"
+-
+-    target_url = f"{scheme}://{netloc}"
+-    if profile in {"web", "full", "standard", "vulnerability"}:
+-        background_tasks.add_task(run_gobuster_scan, scan_id, target_url)
+-    else:
+-        status.gobuster_status = "skipped"
+-        scan_status_store[scan_id] = status
+-        _save_scan_status_store()
+-
++        scan_status_store.pop(scan_id, None)
++        SCAN_SLOTS.release()
++        raise HTTPException(status_code=500, detail="Cannot persist or schedule the scan")
+     return status
++
++
+ @app.get("/scan/{scan_id}", response_model=ScanStatus)
+ def get_scan_status(scan_id: str):
+     status = scan_status_store.get(scan_id)
+     if not status:
+         raise HTTPException(status_code=404, detail="Scan not found")
+-
+-    xml_path = SCANS_DIR / f"{scan_id}.xml"
+-    done_path = SCANS_DIR / f"gobuster_{scan_id}.done"
+-
+-    nmap_done = xml_path.exists() and xml_path.stat().st_size > 100
+-    gobuster_done = done_path.exists()
+-
+-    #  CIDR scans skip gobuster, so don't wait for gobuster_.done
+-    if status.gobuster_status == "skipped":
+-        gobuster_done = True
+-
+-    if nmap_done and gobuster_done:
+-        status.status = "completed"
+-        if not status.completed_at:
+-            status.completed_at = _utc_now()
+-        # if gobuster was skipped, keep it skipped; otherwise mark completed
+-        if status.gobuster_status != "skipped":
+-            status.gobuster_status = "completed"
+-        status.message = "Scan fully completed."
+-        scan_status_store[scan_id] = status
+-        _save_scan_status_store()
+-
+-    elif nmap_done and not gobuster_done:
+-        status.status = "nmap_done"
+-        status.gobuster_status = "running"
+-        if status.status not in ("failed",):
+-            status.message = "Nmap completed. Waiting for Gobuster..."
+-        scan_status_store[scan_id] = status
+-
+-    elif not nmap_done:
+-        if status.status not in ("failed",):
+-            status.status = "running"
+-            status.message = "Nmap scan in progress..."
+-        scan_status_store[scan_id] = status
+-
++    # Worker outcomes are authoritative. File size/.done markers cannot erase errors.
+     return status
++
+ 
+ @app.get("/scan/{scan_id}/raw")
+ def get_raw_scan(scan_id: str):
+@@ -693,24 +503,12 @@
+     if not xml_path.exists():
+         raise FileNotFoundError(f"XML file not found: {xml_path}")
+ 
+-    #  Wait a bit if Nmap is still writing the file (prevents truncated XML parse)
+-    xml_content = ""
+-    for _ in range(20):  # 20 * 0.5s = 10 seconds max wait
+-        with open(xml_path, "r", encoding="utf-8", errors="ignore") as f:
+-            xml_content = f.read()
+-
+-        if xml_content.strip() and "</nmaprun>" in xml_content:
+-            break
+-
+-        time.sleep(0.5)
+-
+-    if not xml_content.strip():
+-        raise ValueError("Nmap XML is empty (scan not finished yet)")
+-
+-    if "</nmaprun>" not in xml_content:
+-        raise ValueError("Nmap XML is incomplete (scan still running). Try again in a few seconds.")
+-
+-    data = xmltodict.parse(xml_content)
++    if xml_path.stat().st_size > 16 * 1024 * 1024:
++        raise ValueError("Nmap XML exceeds 16 MiB")
++    xml_content = xml_path.read_text(encoding="utf-8")
++    if not xml_content.strip() or "</nmaprun>" not in xml_content:
++        raise ValueError("Nmap XML is empty or incomplete")
++    data = xmltodict.parse(xml_content, disable_entities=True)
+ 
+     nmaprun = data.get("nmaprun", {})
+     raw_hosts = nmaprun.get("host", [])
+@@ -841,7 +639,7 @@
+     scan_status = scan_status_store.get(scan_id)
+     if not scan_status:
+         raise HTTPException(status_code=404, detail="Scan not found")
+-    if getattr(scan_status, "status", "") not in ("completed", "nmap_done"):
++    if scan_status.nmap_status != "completed" and scan_status.status not in ("completed", "nmap_done"):
+         raise HTTPException(status_code=400, detail=f"Scan not completed ({scan_status.status}): {scan_status.message}")
+ 
+     xml_path = SCANS_DIR / f"{scan_id}.xml"
+@@ -869,6 +667,8 @@
+     for host in parsed.get("hosts", []):
+         ip = host.get("ip") or "unknown"
+         for service in host.get("services", []):
++            if service.get("state") != "open":
++                continue
+             location = f"{ip}:{service.get('port')}/{service.get('protocol', 'tcp')}"
+             for script in service.get("nse_findings", []):
+                 findings.append({
+@@ -947,6 +747,9 @@
+             service["nvd"] = {"keyword": None, "cves": [], "status": "not_queried"}
+             service["remediation"] = service_remediation(service)
+             service.update(pcvp_score_for_service(service, exposure))
++            if service.get("state") != "open":
++                service.update(pcvp_score=0, pcvp_level="informational",
++                               pcvp_reasons=["This port was not observed open; review its recorded state."])
+ 
+ 
+ def enrich_scan_data(scan_id: str) -> tuple[dict, Optional[dict]]:
+@@ -988,7 +791,7 @@
+     scan_status = scan_status_store.get(scan_id)
+     if not scan_status:
+         raise HTTPException(status_code=404, detail="Scan not found")
+-    if getattr(scan_status, "status", "") not in ("completed", "nmap_done"):
++    if scan_status.nmap_status != "completed" and scan_status.status not in ("completed", "nmap_done"):
+         raise HTTPException(status_code=400, detail=f"Scan not completed ({scan_status.status}): {scan_status.message}")
+ 
+     xml_path = SCANS_DIR / f"{scan_id}.xml"
+@@ -1028,25 +831,29 @@
+     friendly_error: Optional[str] = None
+ 
+     try:
++        host = urlparse(url).hostname
++        if scan_st is None or scan_st.nmap_status != "completed":
++            raise ScopeError("Web assessment requires a completed authorized network scan")
++        validate_targets([host], scan_st.approved_scope)
++        if host not in scan_st.authorized_targets:
++            raise ScopeError("Web target is outside saved scan targets")
++        validate_request(url, scan_st.ports, "web")
+         audit_path = SCANS_DIR / f"web_audit_{scan_id}.json"
+         audit = run_web_security_assessment(url)
+         audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+ 
+         urls = [url]
+-        if url.lower().startswith("http://"):
+-            urls.append("https://" + url[7:])
+ 
+         last_error = ""
+         for candidate_url in urls:
+             cmd = [
+-                str(GOBUSTER_EXE),
++                resolve_executable("RISKLENS_GOBUSTER_PATH", "gobuster"),
+                 "dir",
+                 "-u", candidate_url,
+                 "-w", str(GOBUSTER_WORDLIST),
+                 "-o", str(output_path),
+-                "-t", "30",
++                "-t", "2",
+                 "--timeout", "10s",
+-                "--no-tls-validation",
+                 "--no-color",
+                 "-q",
+             ]
+@@ -1054,14 +861,18 @@
+                 cmd,
+                 capture_output=True,
+                 text=True,
+-                timeout=300,
++                timeout=120,
++                shell=False,
++                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
++                env={key: value for key, value in os.environ.items()
++                     if key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}},
+             )
+             if result.returncode == 0:
+                 last_error = ""
+                 break
+-            last_error = (result.stderr or result.stdout or "").strip()
+-
+-        if last_error and not output_path.exists():
++            last_error = f"Gobuster exited with code {result.returncode}: " + (result.stderr or result.stdout or "No diagnostic output").strip()
++
++        if last_error:
+             gobuster_failed = True
+             raw_err = last_error or "Gobuster exited with an error"
+             friendly_error = _normalize_webscan_error(raw_err)
+@@ -1069,12 +880,6 @@
+                 json.dump({
+                     "summary": friendly_error,
+                     "detail": raw_err[:2000],
+-                }, f, indent=2)
+-        elif last_error:
+-            with status_path.open("w", encoding="utf-8") as f:
+-                json.dump({
+-                    "summary": "Gobuster completed with warnings; partial results are available.",
+-                    "detail": last_error[:2000],
+                 }, f, indent=2)
+ 
+     except subprocess.TimeoutExpired:
+diff --git a/backend/scanner/scan_policy.py b/backend/scanner/scan_policy.py
+new file mode 100644
+--- /dev/null
++++ b/backend/scanner/scan_policy.py
+@@ -0,0 +1,162 @@
++"""Finite, IP-only scan policy. Scope is supplied by the local operator, not the request."""
++
++import ipaddress
++import os
++from pathlib import Path
++import re
++import shutil
++from urllib.parse import urlsplit
++
++
++MAX_HOSTS = 32
++PROFILES = {
++    "quick": {"top_ports": 100, "host_timeout": 30, "timeout": 120, "version": False},
++    "standard": {"top_ports": 1000, "host_timeout": 60, "timeout": 300, "version": True},
++    "web": {"top_ports": 1000, "host_timeout": 60, "timeout": 300, "version": True},
++}
++
++
++class ScopeError(ValueError):
++    pass
++
++
++class ConfigurationError(ValueError):
++    pass
++
++
++def resolve_executable(variable: str, program: str) -> str:
++    configured = os.environ.get(variable, "").strip()
++    if configured:
++        path = Path(configured)
++        if not path.is_absolute() or not path.is_file():
++            raise ConfigurationError(f"{variable} must be an absolute path to an existing executable")
++        if os.name == "nt" and path.suffix.lower() != ".exe":
++            raise ConfigurationError(f"{variable} must point to an .exe file")
++        if os.name != "nt" and not os.access(path, os.X_OK):
++            raise ConfigurationError(f"{variable} is not executable")
++        return str(path.resolve())
++    located = shutil.which(program)
++    if not located:
++        raise ConfigurationError(f"{program} not found; add it to PATH or set {variable}")
++    path = Path(located)
++    if not path.is_file() or (os.name == "nt" and path.suffix.lower() != ".exe"):
++        raise ConfigurationError(f"{program} must resolve to an executable file")
++    return str(path.resolve())
++
++
++def approved_networks() -> list:
++    raw = os.environ.get("RISKLENS_ALLOWED_TARGETS", "").strip()
++    if not raw:
++        raise ScopeError("No approved scope. Set RISKLENS_ALLOWED_TARGETS to authorized IPs/CIDRs")
++    try:
++        parts = raw.split(",")
++        if len(parts) > 64 or any(not part.strip() for part in parts):
++            raise ValueError()
++        return [ipaddress.ip_network(part.strip(), strict=True) for part in parts]
++    except ValueError as exc:
++        raise ConfigurationError("RISKLENS_ALLOWED_TARGETS contains an invalid or noncanonical IP/CIDR") from exc
++
++
++def allowed_address(address) -> bool:
++    return address.is_loopback or not (address.is_multicast or address.is_unspecified or address.is_link_local or address.is_reserved)
++
++
++def validate_targets(targets: list[str], scope: list[str] | None = None) -> list[str]:
++    current = approved_networks()
++    submitted = [ipaddress.ip_network(item, strict=True) for item in scope] if scope is not None else current
++    if not targets or len(targets) > MAX_HOSTS:
++        raise ValueError(f"Scan requires 1–{MAX_HOSTS} target addresses")
++    addresses = []
++    for raw in targets:
++        address = ipaddress.ip_address(raw)
++        if not allowed_address(address):
++            raise ScopeError("Multicast, unspecified, link-local, and reserved targets are not supported")
++        for networks in (current, submitted):
++            if not any(address.version == net.version and address in net for net in networks):
++                raise ScopeError(f"Target {address} is outside explicitly approved scope")
++        addresses.append(address)
++    if len({address.version for address in addresses}) != 1:
++        raise ValueError("A scan must use one IP address family")
++    return list(dict.fromkeys(str(address) for address in addresses))
++
++
++def normalize_ports(raw: str | None, profile: str) -> str | None:
++    if not raw:
++        return None
++    if len(raw) > 4096 or not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", raw):
++        raise ValueError("Ports must be numeric ports/ranges, for example 22,80,8000-8010")
++    ports = set()
++    for entry in raw.split(","):
++        bounds = entry.split("-")
++        low, high = int(bounds[0]), int(bounds[-1])
++        if not 1 <= low <= high <= 65535:
++            raise ValueError("Ports must be within 1–65535 with ascending ranges")
++        if high - low + 1 > PROFILES[profile]["top_ports"]:
++            raise ValueError(f"Too many ports for {profile}")
++        ports.update(range(low, high + 1))
++        if len(ports) > PROFILES[profile]["top_ports"]:
++            raise ValueError(f"Too many ports for {profile}")
++    return ",".join(str(port) for port in sorted(ports))
++
++
++def validate_request(target: str, ports: str | None, profile: str) -> dict:
++    if profile not in PROFILES:
++        raise ValueError("Supported profiles: quick, standard, web; intrusive vulnerability/full profiles are disabled")
++    target = target.strip()
++    if not target or len(target) > 256 or "%" in target:
++        raise ValueError("Enter an IP address or a canonical CIDR, without zone IDs")
++    scope = approved_networks()
++    scheme = None
++    implied_port = None
++    is_cidr = "/" in target and "://" not in target
++    if is_cidr:
++        network = ipaddress.ip_network(target, strict=True)
++        if network.num_addresses > MAX_HOSTS:
++            raise ValueError(f"CIDR is limited to {MAX_HOSTS} total addresses")
++        if not any(network.version == net.version and network.subnet_of(net) for net in scope):
++            raise ScopeError("CIDR is outside explicitly approved scope")
++        targets = [str(address) for address in network.hosts()]
++        label = str(network)
++    else:
++        try:
++            address = ipaddress.ip_address(target)
++        except ValueError:
++            parsed = urlsplit(target if "://" in target else "//" + target)
++            if parsed.scheme and parsed.scheme not in {"http", "https"}:
++                raise ValueError("Only HTTP/HTTPS origins are supported")
++            if parsed.username or parsed.password or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
++                raise ValueError("Use an IP address or origin without credentials, paths, query, or fragment")
++            address = ipaddress.ip_address(parsed.hostname or "")
++            implied_port = parsed.port
++            scheme = parsed.scheme or None
++        targets = [str(address)]
++        label = str(address)
++    targets = validate_targets(targets)
++    if implied_port is not None and ports and normalize_ports(ports, profile) != str(implied_port):
++        raise ValueError("Target port conflicts with the ports field")
++    ports = normalize_ports(ports or (str(implied_port) if implied_port is not None else None), profile)
++    web_url = None
++    if profile == "web":
++        if is_cidr or len(targets) != 1:
++            raise ValueError("Web assessment requires a single IP origin")
++        if ports is not None and not ports.isdigit():
++            raise ValueError("Web assessment requires one explicit port")
++        scheme = scheme or "http"
++        port = ports or ("443" if scheme == "https" else "80")
++        ports = port
++        host = f"[{targets[0]}]" if ":" in targets[0] else targets[0]
++        web_url = f"{scheme}://{host}:{port}"
++    return {"target": label, "targets": targets, "ports": ports, "scope": [str(net) for net in scope],
++            "web_url": web_url, "cidr": is_cidr}
++
++
++def nmap_command(executable: str, targets: list[str], profile: str, ports: str | None, output: Path) -> list[str]:
++    settings = PROFILES[profile]
++    command = [executable, "-sT", "-n", "-Pn", "-T3", "--max-retries", "1",
++               "--host-timeout", f"{settings['host_timeout']}s"]
++    if ":" in targets[0]:
++        command.append("-6")
++    if settings["version"]:
++        command += ["-sV", "--version-light"]
++    command += ["-p", ports] if ports else ["--top-ports", str(settings["top_ports"])]
++    return command + ["-oX", str(output), *targets]
+diff --git a/frontend/static/app.js b/frontend/static/app.js
+--- a/frontend/static/app.js
++++ b/frontend/static/app.js
+@@ -257,6 +257,7 @@
+     const target = document.getElementById("target").value.trim();
+     const exposure = document.getElementById("exposure").value;
+     const profile = document.getElementById("profile").value;
++    const authorized = document.getElementById("authorized").checked;
+ 
+     if (!target) {
+       statusDiv.textContent = "Please enter a target.";
+@@ -281,11 +282,12 @@
+       const resp = await fetch("/scan", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ target, exposure, profile }),
++        body: JSON.stringify({ target, exposure, profile, authorized }),
+       });
+ 
+       if (!resp.ok) {
+-        statusDiv.textContent = `Error starting scan: ${resp.status}`;
++        const error = await resp.json().catch(() => ({}));
++        statusDiv.textContent = `Error starting scan: ${error.detail || resp.status}`;
+         startBtn.disabled = false;
+         return;
+       }
+@@ -622,7 +624,7 @@
+   tr.innerHTML = `
+     <td>${svc.ip || ""}</td>
+     <td>${svc.port}</td>
+-    <td>${svc.service || ""}</td>
++    <td>${escapeHtml(svc.service || "")} (${escapeHtml(svc.state || "unknown")})</td>
+     <td>${(svc.product || "") + " " + (svc.version || "")}</td>
+     <td><span class="badge ${badgeClass}">${level}</span></td>
+     <td>${svc.pcvp_score ?? ""}</td>
+diff --git a/frontend/templates/index.html b/frontend/templates/index.html
+--- a/frontend/templates/index.html
++++ b/frontend/templates/index.html
+@@ -133,7 +133,7 @@
+               <input
+                 id="target"
+                 required
+-                placeholder="scanme.nmap.org or 192.168.1.10"
++                placeholder="Approved IP or CIDR, e.g. 127.0.0.1"
+                 class="mt-1 w-full min-w-0 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 outline-none focus:ring-2 focus:ring-orange-500"
+               />
+             </div>
+@@ -153,11 +153,11 @@
+             <div class="min-w-0">
+               <label class="text-xs text-slate-400">Scan profile</label>
+               <select id="profile" class="mt-1 w-full min-w-0 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2">
+-                <option value="standard">Standard</option>
+-                <option value="quick">Quick discovery</option>
+-                <option value="vulnerability">Vulnerability assessment</option>
+-                <option value="web">Web assessment</option>
+-                <option value="full">Full lab assessment</option>
++                <option value="standard">Standard: up to 1,000 TCP ports, light version detection</option>
++                <option value="quick">Quick: up to 100 TCP ports</option>
++                <option value="web">Web: explicit HTTP/TLS and directory assessment</option>
++                <option value="vulnerability" disabled>Vulnerability assessment (disabled)</option>
++                <option value="full" disabled>Full lab assessment (disabled)</option>
+               </select>
+             </div>
+ 
+@@ -171,6 +171,10 @@
+               </button>
+             </div>
+           </div>
++          <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
++            <input id="authorized" type="checkbox" required />
++            I am authorized to assess this target within the configured approved scope.
++          </label>
+         </form>
+       </div>
+ 
+@@ -356,7 +360,7 @@
+     </div>
+   </div>
+ 
+-  <script src="/static/app.js?v=19"></script>
++  <script src="/static/app.js?v=20"></script>
+ 
+   <script>
+     const tabBtns = document.querySelectorAll(".tab-btn");
+diff --git a/tests/test_read_only_endpoints.py b/tests/test_read_only_endpoints.py
+--- a/tests/test_read_only_endpoints.py
++++ b/tests/test_read_only_endpoints.py
+@@ -2,6 +2,7 @@
+ 
+ from contextlib import ExitStack
+ import json
++import os
+ from pathlib import Path
+ import subprocess
+ import sys
+@@ -41,7 +42,7 @@
+ </ports></host></nmaprun>"""
+ 
+ 
+-class ReadOnlyEndpointsTest(unittest.TestCase):
++class SavedScanFixture(unittest.TestCase):
+     def setUp(self):
+         self.stack = ExitStack()
+         self.addCleanup(self.stack.close)
+@@ -49,6 +50,10 @@
+             prefix=".risklens-test-", dir=Path(__file__).resolve().parents[1]
+         )))
+         self.directory = directory
++        self.stack.enter_context(patch.dict(os.environ, {
++            "RISKLENS_ALLOWED_TARGETS": "192.0.2.0/24,127.0.0.1/32,::1/128",
++        }))
++        self.stack.enter_context(patch.object(main, "resolve_executable", return_value="mock-nmap.exe"))
+         (directory / f"{SCAN_ID}.xml").write_text(XML, encoding="utf-8")
+         (directory / f"gobuster_{SCAN_ID}.txt").write_text(
+             "/docs (Status: 200) [Size: 10]\n", encoding="utf-8"
+@@ -64,6 +69,8 @@
+         self.stack.enter_context(patch.object(main, "scan_status_store", {SCAN_ID: main.ScanStatus(
+             scan_id=SCAN_ID, target="192.0.2.10", status="completed", exposure="internal",
+             exposure_effective="internal", gobuster_status="completed", created_at="2026-01-01T00:00:00Z",
++            ports="8080", authorized_targets=["192.0.2.10"], approved_scope=["192.0.2.0/24"],
++            authorized=True,
+         )}))
+         credential_attempt.reset_mock()
+         # Start the ASGI portal before blocking sockets: Windows asyncio creates
+@@ -85,6 +92,8 @@
+         for mocked in self.io_mocks:
+             mocked.assert_not_called()
+ 
++
++class ReadOnlyEndpointsTest(SavedScanFixture):
+     def test_all_get_routes_use_only_saved_data(self):
+         for route in main.app.routes:
+             if "GET" not in (getattr(route, "methods", None) or set()):
+@@ -128,28 +137,31 @@
+             self.assertNotIn(token, js)
+         self.assert_no_external_io()
+ 
+-    def test_post_scan_still_schedules_network_and_web_workers(self):
++    def test_standard_submission_does_not_schedule_web(self):
+         with patch.object(main, "run_nmap_scan") as nmap, patch.object(main, "run_gobuster_scan") as web:
+-            response = self.client.post("/scan", json={"target": "127.0.0.1:8080", "profile": "standard"})
++            response = self.client.post("/scan", json={"target": "127.0.0.1:8080", "profile": "standard", "authorized": True})
+             self.assertEqual(response.status_code, 200)
+             scan_id = response.json()["scan_id"]
+-            nmap.assert_called_once_with(scan_id=scan_id, target="127.0.0.1", ports="8080")
+-            web.assert_called_once_with(scan_id, "http://127.0.0.1:8080")
++            nmap.assert_called_once_with(scan_id, "127.0.0.1", "8080")
++            web.assert_not_called()
+         self.assert_no_external_io()
+ 
+     def test_network_worker_still_builds_nmap_command_and_saves_xml(self):
++        main.scan_status_store[SCAN_ID].gobuster_status = "skipped"
++        main.scan_status_store[SCAN_ID].ports = "21,22,80"
+         def fake_nmap(command, **kwargs):
+-            Path(command[command.index("-oX") + 1]).write_text(XML, encoding="utf-8")
++            complete = XML.replace("</nmaprun>", '<runstats><finished exit="success"/></runstats></nmaprun>')
++            Path(command[command.index("-oX") + 1]).write_text(complete, encoding="utf-8")
+             return subprocess.CompletedProcess(command, 0)
+ 
+         with patch.object(main.subprocess, "run", side_effect=fake_nmap) as runner:
+-            main.run_nmap_scan(SCAN_ID, "127.0.0.1", ports="8080")
++            main.run_nmap_scan(SCAN_ID, "192.0.2.10", ports="21,22,80")
+             command = runner.call_args.args[0]
+-            self.assertEqual(command[:4], [main.NMAP_PATH, "-sV", "-T4", "-Pn"])
+-            self.assertEqual(command[-1], "127.0.0.1")
+-            self.assertIn("8080", command)
+-            self.assertEqual(main.scan_status_store[SCAN_ID].status, "nmap_done")
+-            self.assertEqual((self.directory / f"{SCAN_ID}.xml").read_text(encoding="utf-8"), XML)
++            self.assertEqual(command[:4], ["mock-nmap.exe", "-sT", "-n", "-Pn"])
++            self.assertEqual(command[-1], "192.0.2.10")
++            self.assertIn("21,22,80", command)
++            self.assertEqual(main.scan_status_store[SCAN_ID].status, "completed")
++            self.assertEqual(main.parse_nmap_xml(self.directory / f"{SCAN_ID}.xml")["hosts"][0]["ip"], "192.0.2.10")
+         self.assert_no_external_io()
+ 
+     def test_web_worker_still_saves_audit_and_gobuster_output(self):
+@@ -159,12 +171,13 @@
+             )
+             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+ 
+-        audit = {"url": "http://127.0.0.1:8080", "http": {"status": 200}}
++        main.scan_status_store[SCAN_ID].nmap_status = "completed"
++        audit = {"url": "http://192.0.2.10:8080", "http": {"status": 200}}
+         with patch.object(main, "run_web_security_assessment", return_value=audit) as assessment:
+             with patch.object(main.subprocess, "run", side_effect=fake_gobuster) as runner:
+                 main.run_gobuster_scan(SCAN_ID, audit["url"])
+                 assessment.assert_called_once_with(audit["url"])
+-                self.assertEqual(runner.call_args.args[0][:2], [str(main.GOBUSTER_EXE), "dir"])
++                self.assertEqual(runner.call_args.args[0][:2], ["mock-nmap.exe", "dir"])
+         saved = json.loads((self.directory / f"web_audit_{SCAN_ID}.json").read_text(encoding="utf-8"))
+         self.assertEqual(saved, audit)
+         self.assertEqual(main.scan_status_store[SCAN_ID].gobuster_status, "completed")
+diff --git a/tests/test_scan_execution.py b/tests/test_scan_execution.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_scan_execution.py
+@@ -0,0 +1,268 @@
++"""Scope and Nmap lifecycle tests. Every scanner process is mocked."""
++
++import ipaddress
++import json
++import os
++from pathlib import Path
++import subprocess
++import unittest
++from unittest.mock import Mock, patch
++
++import test_read_only_endpoints as fixtures
++from backend import main
++from backend.scanner import scan_policy as policy
++
++
++def scan_xml(addresses, *, timedout=False):
++    hosts = []
++    for address in addresses:
++        family = "ipv6" if ipaddress.ip_address(address).version == 6 else "ipv4"
++        hosts.append(f'<host timedout="{str(timedout).lower()}"><status state="up"/>'
++                     f'<address addr="{address}" addrtype="{family}"/>'
++                     '<ports><port protocol="tcp" portid="80"><state state="open"/>'
++                     '<service name="http"/></port>'
++                     '<port protocol="tcp" portid="81"><state state="closed"/></port></ports></host>')
++    return '<nmaprun>' + ''.join(hosts) + '<runstats><finished exit="success"/></runstats></nmaprun>'
++
++
++class ScanExecutionTest(fixtures.SavedScanFixture):
++    def submit(self, **overrides):
++        body = {"target": "192.0.2.10", "profile": "quick", "authorized": True}
++        body.update(overrides)
++        return self.client.post("/scan", json=body)
++
++    def fake_scan(self, command, **kwargs):
++        targets = command[command.index("-oX") + 2:]
++        Path(command[command.index("-oX") + 1]).write_text(scan_xml(targets), encoding="utf-8")
++        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
++
++    def test_quick_and_standard_parameters_and_artifacts(self):
++        for profile, count, timeout in (("quick", "100", 120), ("standard", "1000", 300)):
++            with self.subTest(profile=profile), patch.object(main.subprocess, "run", side_effect=self.fake_scan) as runner:
++                response = self.submit(profile=profile)
++                self.assertEqual(response.status_code, 200, response.text)
++                scan_id = response.json()["scan_id"]
++                result = self.client.get(f"/scan/{scan_id}").json()
++                self.assertEqual(result["status"], "completed", result)
++                self.assertEqual(result["gobuster_status"], "skipped")
++                self.assertEqual(result["nmap_exit_code"], 0)
++                command = runner.call_args.args[0]
++                for forbidden in ("--script", "-sC", "-A", "-O", "--osscan-guess"):
++                    self.assertNotIn(forbidden, command)
++                self.assertEqual("-sV" in command, profile == "standard")
++                self.assertEqual(command[command.index("--top-ports") + 1], count)
++                self.assertEqual(runner.call_args.kwargs["timeout"], timeout)
++                self.assertFalse(runner.call_args.kwargs["shell"])
++                self.assertEqual(runner.call_count, 1)
++                saved = self.directory / f"{scan_id}.xml"
++                self.assertTrue(saved.is_file())
++                self.assertFalse(saved.with_suffix(".xml.tmp").exists())
++                record = json.loads((self.directory / f"nmap_{scan_id}.json").read_text())
++                self.assertEqual(record["xml"], saved.name)
++                self.assertEqual(record["exit_code"], 0)
++                services = self.client.get(f"/scan/{scan_id}/parsed").json()["data"]["hosts"][0]["services"]
++                self.assertEqual([(s["port"], s["state"]) for s in services], [(80, "open"), (81, "closed")])
++                annotated = self.client.get(f"/scan/{scan_id}/nvd").json()["data"]["hosts"][0]["services"]
++                self.assertEqual(annotated[1]["pcvp_score"], 0)
++        self.assert_no_external_io()
++
++    def test_cidr_uses_same_profile_without_discovery_or_nse(self):
++        with patch.object(main.subprocess, "run", side_effect=self.fake_scan) as runner:
++            response = self.submit(target="192.0.2.0/30")
++            self.assertEqual(response.status_code, 200, response.text)
++            scan_id = response.json()["scan_id"]
++            result = self.client.get(f"/scan/{scan_id}").json()
++            self.assertEqual(result["authorized_targets"], ["192.0.2.1", "192.0.2.2"])
++            self.assertEqual(result["status"], "completed", result)
++            self.assertEqual(runner.call_count, 1)
++            command = runner.call_args.args[0]
++            self.assertNotIn("--script", command)
++            self.assertNotIn("-sV", command)
++            alive = json.loads((self.directory / f"alive_{scan_id}.json").read_text())
++            self.assertEqual(alive["alive"], ["192.0.2.1", "192.0.2.2"])
++        self.assert_no_external_io()
++
++    def test_explicit_ports_replace_top_ports(self):
++        with patch.object(main.subprocess, "run", side_effect=self.fake_scan) as runner:
++            response = self.submit(ports="81,80,80")
++            self.assertEqual(response.status_code, 200, response.text)
++            command = runner.call_args.args[0]
++            self.assertNotIn("--top-ports", command)
++            self.assertEqual(command[command.index("-p") + 1], "80,81")
++            self.assertEqual(self.client.get(f'/scan/{response.json()["scan_id"]}').json()["status"], "completed")
++
++    def test_denied_requests_do_not_create_jobs_or_artifacts(self):
++        before = set(self.directory.iterdir())
++        cases = [({"authorized": False}, 403), ({"target": "192.0.3.10"}, 403),
++                 ({"target": "192.0.2.0/23"}, 400), ({"target": "192.0.3.0/30"}, 403), ({"target": "192.0.2.1/30"}, 400),
++                 ({"target": "example.com"}, 400), ({"target": "--script=vuln"}, 400),
++                 ({"target": "192.0.2.10 192.0.3.10"}, 400),
++                 ({"ports": "80 --script vuln"}, 400), ({"ports": "1-65535"}, 400),
++                 ({"ports": "0"}, 400), ({"ports": "65536"}, 400), ({"ports": "90-80"}, 400),
++                 ({"target": "192.0.2.10:80", "ports": "81"}, 400),
++                 ({"profile": "unknown"}, 400), ({"profile": "vulnerability"}, 400),
++                 ({"profile": "full"}, 400), ({"profile": "web", "target": "192.0.2.0/30"}, 400)]
++        for overrides, expected in cases:
++            with self.subTest(overrides=overrides):
++                self.assertEqual(self.submit(**overrides).status_code, expected)
++        self.assertEqual(set(self.directory.iterdir()), before)
++        self.assert_no_external_io()
++
++    def test_empty_and_invalid_server_scope_fail_closed(self):
++        with patch.dict(os.environ, {"RISKLENS_ALLOWED_TARGETS": ""}):
++            self.assertEqual(self.submit().status_code, 403)
++        with patch.dict(os.environ, {"RISKLENS_ALLOWED_TARGETS": "not-a-cidr"}):
++            self.assertEqual(self.submit().status_code, 503)
++        self.assert_no_external_io()
++
++    def test_dot_zero_is_a_single_ip_and_ipv6_is_literal(self):
++        plan = policy.validate_request("192.0.2.0", None, "quick")
++        self.assertEqual(plan["targets"], ["192.0.2.0"])
++        self.assertFalse(plan["cidr"])
++        with patch.object(main.subprocess, "run", side_effect=self.fake_scan) as runner:
++            response = self.submit(target="::1")
++            self.assertEqual(response.status_code, 200, response.text)
++            self.assertIn("-6", runner.call_args.args[0])
++            self.assertEqual(self.client.get(f'/scan/{response.json()["scan_id"]}').json()["status"], "completed")
++
++    def test_exit_error_retains_stderr_and_is_not_erased_by_polling(self):
++        def fail(command, **kwargs):
++            self.fake_scan(command, **kwargs)
++            return subprocess.CompletedProcess(command, 2, stdout="", stderr="permission denied")
++        with patch.object(main.subprocess, "run", side_effect=fail) as runner:
++            response = self.submit()
++            scan_id = response.json()["scan_id"]
++            for _ in range(2):
++                result = self.client.get(f"/scan/{scan_id}").json()
++                self.assertEqual(result["status"], "failed")
++                self.assertEqual(result["nmap_exit_code"], 2)
++                self.assertIn("permission denied", result["message"])
++            self.assertEqual(runner.call_count, 1)
++            self.assertFalse((self.directory / f"{scan_id}.xml").exists())
++            self.assertTrue((self.directory / f"{scan_id}.xml.partial").exists())
++            self.assertEqual(json.loads((self.directory / f"nmap_{scan_id}.json").read_text())["stderr"], "permission denied")
++
++    def test_timeout_and_os_error_are_terminal_and_release_slot(self):
++        for error in (subprocess.TimeoutExpired(["nmap"], 120), FileNotFoundError("nmap disappeared")):
++            with self.subTest(error=error), patch.object(main.subprocess, "run", side_effect=error):
++                response = self.submit()
++                self.assertEqual(response.status_code, 200, response.text)
++                status = self.client.get(f'/scan/{response.json()["scan_id"]}').json()
++                self.assertEqual(status["status"], "failed")
++                self.assertTrue(status["completed_at"])
++                self.assertEqual(main.SCAN_SLOTS.acquire(blocking=False), True)
++                main.SCAN_SLOTS.release()
++
++    def test_bad_missing_failed_or_out_of_scope_xml_is_not_published(self):
++        for xml in ("", "<nmaprun>", "<other/>",
++                    '<nmaprun><runstats><finished exit="error"/></runstats></nmaprun>',
++                    scan_xml(["192.0.3.10"]), scan_xml([], timedout=False),
++                    scan_xml(["192.0.2.10"], timedout=True)):
++            def fake(command, **kwargs):
++                Path(command[command.index("-oX") + 1]).write_text(xml, encoding="utf-8")
++                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
++            with self.subTest(xml=xml[:40]), patch.object(main.subprocess, "run", side_effect=fake):
++                response = self.submit()
++                scan_id = response.json()["scan_id"]
++                self.assertEqual(self.client.get(f"/scan/{scan_id}").json()["status"], "failed")
++                self.assertFalse((self.directory / f"{scan_id}.xml").exists())
++
++    def test_scope_is_rechecked_in_worker(self):
++        status = main.scan_status_store[fixtures.SCAN_ID]
++        with patch.dict(os.environ, {"RISKLENS_ALLOWED_TARGETS": "127.0.0.1/32"}):
++            main.run_nmap_scan(fixtures.SCAN_ID, "192.0.2.10", "8080")
++        self.assertEqual(status.status, "failed")
++        self.assertIn("outside explicitly approved scope", status.message)
++        self.assert_no_external_io()
++
++    def test_busy_scanner_rejects_queueing(self):
++        main.SCAN_SLOTS.acquire()
++        try:
++            self.assertEqual(self.submit().status_code, 409)
++        finally:
++            main.SCAN_SLOTS.release()
++        self.assert_no_external_io()
++
++    def test_missing_executable_rejected_before_job_creation(self):
++        with patch.object(main, "resolve_executable", side_effect=policy.ConfigurationError("nmap missing")):
++            self.assertEqual(self.submit().status_code, 503)
++        self.assert_no_external_io()
++
++    def test_xml_parser_rejects_partial_without_waiting(self):
++        path = self.directory / "incomplete.xml"
++        path.write_text("<nmaprun>")
++        with self.assertRaises(ValueError):
++            main.parse_nmap_xml(path)
++
++    def test_missing_xml_is_failed_even_with_zero_exit_code(self):
++        with patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess(["nmap"], 0, "", "")):
++            response = self.submit()
++        result = self.client.get(f'/scan/{response.json()["scan_id"]}').json()
++        self.assertEqual(result["status"], "failed")
++        self.assertIn("XML missing", result["message"])
++
++    def test_xml_ports_outside_requested_coverage_are_rejected(self):
++        with patch.object(main.subprocess, "run", side_effect=self.fake_scan):
++            response = self.submit(ports="80")
++        result = self.client.get(f'/scan/{response.json()["scan_id"]}').json()
++        self.assertEqual(result["status"], "failed")
++        self.assertIn("outside the requested TCP coverage", result["message"])
++
++    def test_worker_requires_saved_authorization(self):
++        main.scan_status_store[fixtures.SCAN_ID].authorized = False
++        main.run_nmap_scan(fixtures.SCAN_ID, "192.0.2.10", "8080")
++        self.assertEqual(main.scan_status_store[fixtures.SCAN_ID].status, "failed")
++        self.assert_no_external_io()
++
++    def test_restart_marks_unfinished_jobs_failed_without_resuming(self):
++        status = main.scan_status_store[fixtures.SCAN_ID]
++        status.status = "running"
++        status.nmap_status = "running"
++        main._save_scan_status_store()
++        main._load_scan_status_store()
++        result = main.scan_status_store[fixtures.SCAN_ID]
++        self.assertEqual(result.status, "failed")
++        self.assertEqual(result.nmap_status, "failed")
++        saved = json.loads(main.SCAN_STATUS_FILE.read_text())
++        self.assertEqual(saved[fixtures.SCAN_ID]["status"], "failed")
++        self.assert_no_external_io()
++
++    def test_web_failure_without_stderr_cannot_be_completed(self):
++        status = main.scan_status_store[fixtures.SCAN_ID]
++        status.nmap_status = "completed"
++        audit = {"url": "http://192.0.2.10:8080", "checks": []}
++        with patch.object(main, "run_web_security_assessment", return_value=audit):
++            with patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess(["gobuster"], 9, "", "")):
++                main.run_gobuster_scan(fixtures.SCAN_ID, audit["url"])
++        self.assertEqual(status.gobuster_status, "failed")
++        message = json.loads((self.directory / f"gobuster_{fixtures.SCAN_ID}.status").read_text())
++        self.assertIn("code 9", message["detail"])
++
++    def test_web_assessment_does_not_follow_redirects_or_use_proxies(self):
++        response = Mock(status_code=302, url="http://192.0.2.10:8080", text="",
++                        headers={"Location": "https://outside.example/"})
++        with patch.object(main.requests, "Session") as session_type:
++            session = session_type.return_value.__enter__.return_value
++            session.get.return_value = response
++            result = main.run_web_security_assessment(response.url)
++            self.assertFalse(session.trust_env)
++            session.get.assert_called_once_with(response.url, timeout=15, allow_redirects=False, verify=True)
++            self.assertEqual(result["http"]["status"], 302)
++        self.assert_no_external_io()
++
++
++class ExecutableConfigurationTest(unittest.TestCase):
++    def test_invalid_explicit_path_does_not_fall_back_to_path(self):
++        with patch.dict(os.environ, {"RISKLENS_NMAP_PATH": "relative/nmap.exe"}), patch.object(policy.shutil, "which") as which:
++            with self.assertRaises(policy.ConfigurationError):
++                policy.resolve_executable("RISKLENS_NMAP_PATH", "nmap")
++            which.assert_not_called()
++
++    def test_missing_path_program_reports_configuration_error(self):
++        with patch.dict(os.environ, {"RISKLENS_NMAP_PATH": ""}), patch.object(policy.shutil, "which", return_value=None):
++            with self.assertRaises(policy.ConfigurationError):
++                policy.resolve_executable("RISKLENS_NMAP_PATH", "nmap")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,7 +1,6 @@
+ # RiskLens
+ 
+-RiskLens is a Windows web application that runs Nmap service discovery and
+-vulnerability NSE scripts,
++RiskLens is a Windows web application that runs bounded Nmap TCP scans,
+ calculates a contextual risk score from saved observations, builds an attack graph, and optionally
+ performs web directory discovery with Gobuster.
+ 
+@@ -17,7 +16,6 @@
+ - Windows 10 or Windows 11
+ - Python 3.11 or newer (Python 3.13 is supported by the included dependency set)
+ - Nmap for Windows
+-- Angry IP Scanner, required only for CIDR/subnet scans
+ - A modern browser
+ - Internet access for the existing CDN-loaded frontend libraries
+ 
+@@ -55,32 +53,31 @@
+ 
+ ### Install external scanners
+ 
+-Install Nmap so this file exists:
+-
+-```text
+-C:\Program Files (x86)\Nmap\nmap.exe
+-```
+-
+-Install Angry IP Scanner so this file exists:
+-
+-```text
+-C:\Tools\AngryIP\ipscan.exe
+-```
+-
+-The paths are currently configured in `backend\main.py`. If you install either
+-tool elsewhere, update `NMAP_PATH` or `IPSCAN_PATH` before running the server.
+-Gobuster is already included and normally requires no separate installation.
+-
+-Check the required files:
+-
+-```powershell
+-Test-Path 'C:\Program Files (x86)\Nmap\nmap.exe'
+-Test-Path 'C:\Tools\AngryIP\ipscan.exe'
+-Test-Path '.\gobuster_Windows_x86_64\gobuster.exe'
+-Test-Path '.\wordlists\common.txt'
+-```
+-
+-The first two commands should return `True`.
++Install Nmap and add it to PATH, or configure its absolute executable path.
++No executable path is hard-coded in the application. An explicit invalid path
++fails instead of silently falling back. CIDR scans use Nmap directly; Angry IP
++Scanner is no longer required.
++
++```powershell
++# Configure only targets you own or have explicit permission to assess.
++$env:RISKLENS_ALLOWED_TARGETS = '127.0.0.1/32'
++
++# If Nmap is already on PATH:
++$env:RISKLENS_NMAP_PATH = (Get-Command nmap -ErrorAction Stop).Source
++
++# Alternatively, resolve your installed executable, for example:
++# $env:RISKLENS_NMAP_PATH = (Resolve-Path 'C:\Program Files (x86)\Nmap\nmap.exe').Path
++
++# Optional: needed only when explicitly selecting the Web profile.
++$env:RISKLENS_GOBUSTER_PATH = (Resolve-Path '.\gobuster_Windows_x86_64\gobuster.exe').Path
++```
++
++Scope is a comma-separated list of canonical IPs/CIDRs. It is empty by default:
++no scope means no scan. Hostnames, implicit subnet expansion, targets outside
++scope, multicast/unspecified/link-local/reserved addresses, and requests without
++`authorized: true` are rejected. Loopback is supported. A scan permits at most
++32 total CIDR addresses, 100 Quick ports or 1,000 Standard ports, and one active
++job per application process. Run a single Uvicorn worker.
+ 
+ ## Local result viewing
+ 
+@@ -123,46 +120,43 @@
+ 
+ ## Run a scan
+ 
+-1. Enter a permitted hostname or IP address in **Target**, for example
+-   `scanme.nmap.org` or `192.168.1.10`.
+-2. Choose **Auto**, **External**, or **Internal** exposure context.
+-3. Click **Start scan**.
+-4. Wait for Nmap, its `vuln` NSE checks, and (for web targets) Gobuster to
+-   complete. NSE checks can take longer than a basic port scan.
+-5. Review **Overview**, **Services**, **Attack Graph**, and **Web Scan**.
+-6. Open **Details** for local review guidance and use **Download PDF** when the scan is
+-   complete.
+-
+-For a specific port, enter it as part of the target, such as
+-`192.168.1.10:8080`. CIDR targets such as `192.168.1.0/24` use Angry IP
+-Scanner to find live hosts first, so they take longer and skip Gobuster.
+-
+-The server also exposes interactive API documentation at:
+-
+-<http://127.0.0.1:8787/docs>
+-
+-Nmap vulnerability-script evidence appears in the **NSE Findings** column and
+-in each service's **Details** dialog. The scan uses `--script vuln`, `-Pn`, and
+-OS detection with a safe fallback when elevated Nmap probes are unavailable.
+-Only scan systems for which you have explicit authorization because some NSE
+-checks can be intrusive and may generate more traffic than service discovery.
+-
+-The Overview tab also provides an asset inventory with IP addresses, hostnames,
+-hostnames saved by Nmap, MAC/vendor data when available, OS matches, services, and
+-ports. The Web Scan tab adds HTTP status/header checks, security-header
+-coverage, technology hints, TLS protocol/cipher information, and certificate
+-metadata when the target uses HTTPS.
++1. Configure the server's approved scope before launch, then enter an approved
++   literal IP, IP:port, HTTP(S) IP origin, or canonical CIDR in **Target**.
++2. Choose exposure context and Quick, Standard, or explicit Web assessment.
++3. Check the authorization acknowledgement and click **Start scan**.
++4. Polling reports the worker's actual completion or error; a saved file cannot
++   erase a failure. No automatic credential testing or online enrichment occurs.
++5. Review network ports and their recorded state. The Web tab is separate.
++6. Open Details for local guidance, or download CSV/PDF from saved evidence.
++
++A `.0` address remains a single address. CIDR is limited to 32 total addresses
++(e.g. `/27` or smaller IPv4 networks); network/broadcast addresses are excluded
++where `ipaddress.hosts()` does so. Approved private targets are not inferred from
++a private address: they must still match server scope. Scope is checked again
++before the worker executes. Multiple IP families cannot be mixed in one scan.
+ 
+ ### Scan profiles
+ 
+-Choose a profile before starting a scan:
+-
+-- **Quick discovery**: fast host and port discovery without the heavier checks.
+-- **Standard**: service/version detection with the normal RiskLens workflow.
+-- **Vulnerability assessment**: service detection, OS detection, and Nmap
+-  `vuln` NSE checks.
+-- **Web assessment**: standard discovery plus HTTP/TLS and Gobuster checks.
+-- **Full lab assessment**: all available network and web checks.
++| Profile | Default TCP coverage | Version probes | HTTP/Gobuster | Process limit |
++|---|---|---|---|---|
++| Quick | Top 100 ports | No | No | 120 seconds |
++| Standard | Top 1,000 ports | `-sV --version-light` | No | 300 seconds |
++| Web | One explicit HTTP(S) port | Light | Explicit opt-in | Nmap 300 seconds; Gobuster 120 seconds |
++
++Validated explicit ports replace top-port defaults and remain subject to the
++profile's port-count cap. Both network profiles use `-sT -n -Pn -T3`, one retry,
++and 30-second Quick / 60-second Standard per-host timeout. No OS guessing,
++`--script vuln`, `-sC`, `-A`, or automatic retry with different flags is used.
++Vulnerability/full profile strings return HTTP 400 and are disabled in the UI.
++Standard performs active service/version probes; Quick performs TCP connects.
++Windows Nmap/Npcap permissions must still be configured appropriately.
++
++The Web profile accepts a single approved origin and one port, does not follow
++redirects, does not retry HTTPS or disable certificate verification after an
++HTTP failure, and uses two Gobuster threads. Existing saved NSE/OS evidence is
++still readable; new network scans do not request OS or vulnerability scripts.
++
++Interactive API documentation: <http://127.0.0.1:8787/docs>.
+ 
+ The **Findings** tab converts raw scanner output into prioritized findings with
+ severity, confidence, affected asset, evidence, source, and remediation. Use
+@@ -192,10 +186,12 @@
+ python -m pip install -r requirements.txt
+ ```
+ 
+-### Nmap or Angry IP errors
+-
+-Confirm the executable paths with the `Test-Path` commands above. If they are
+-different, update the two constants in `backend\main.py` and restart Uvicorn.
++### Scanner configuration errors
++
++A missing or invalid executable returns HTTP 503 before any job is created.
++Set `RISKLENS_NMAP_PATH` or use PATH; Web additionally needs Gobuster. Scope or
++authorization denial returns 403, malformed input/disabled profile returns 400,
++and an already active scanner returns 409. No automatic retry is performed.
+ 
+ ### PowerShell says the old `venv` is invalid
+ 
+@@ -217,7 +213,19 @@
+ & '.\.venv\Scripts\python.exe' -B -m unittest discover -s tests -v
+ ```
+ 
+-The suite uses synthetic saved evidence and in-process HTTP requests. It blocks
++The suite uses synthetic XML, mocked scanner processes, and in-process HTTP requests. It blocks
+ outbound requests, DNS, socket connections, subprocesses, and credential annotation
+ while reading every GET route, including CSV/PDF. Scanner submission is tested
+ with mocked workers, not a real target scan.
++
++
++### Nmap artifacts and failures
++
++Completed scans retain `backend/scans/<id>.xml`. Nmap writes `.xml.tmp` first;
++only XML with successful run statistics, the requested hosts, and matching TCP
++port coverage is published. Rejected/partial XML is retained as `.xml.partial`.
++`nmap_<id>.json` records exact arguments, approved scope, timeout, exit code,
++stderr tail, and outcome. Status/history remain in `scan_status.json` with
++additive fields for approved targets, requested ports, Nmap state, and exit code.
++Old JSON records still load. Interrupted jobs become failed on restart and are
++never automatically resumed. See [Day 3 implementation and tests](docs/DAY-03.md).
+diff --git a/docs/DAY-03.md b/docs/DAY-03.md
+new file mode 100644
+--- /dev/null
++++ b/docs/DAY-03.md
+@@ -0,0 +1,244 @@
++# Day 3 — bounded Nmap profiles and explicit authorized scope
++
++## What the inspected code did
++
++The starting point was the existing Day 2 working tree; its uncommitted changes
++were preserved. The original single-target commands assembled in the main module
++were:
++
++```text
++Quick:    nmap -T4 -Pn [-p PORTS] -oX backend/scans/ID.xml IP
++Standard: nmap -sV -T4 -Pn [-p PORTS] -oX backend/scans/ID.xml IP
++```
++
++Neither supplied a smaller default port set for Quick. Without `-p`, Nmap's
++normal TCP coverage is the most common 1,000 ports. Standard also automatically
++scheduled HTTP/TLS assessment and Gobuster. The CIDR branch first ran Angry IP
++Scanner, then ignored the selected profile and ran:
++
++```text
++nmap -sV -O --osscan-guess -T4 -Pn --script vuln [-p PORTS] -oX ID.xml.tmp IP...
++```
++
++Single-target processes had no application timeout. A failed command was retried
++with OS-detection arguments removed, even when the failure was unrelated. Status
++polling could overwrite failure based on XML size and a Gobuster `.done` marker.
++The target parser allowed hostnames and silently converted `.0` addresses to /24.
++XML reads waited up to ten seconds for the scanner to finish writing.
++
++## Implemented profiles and real commands
++
++[scan_policy.py](../backend/scanner/scan_policy.py) contains one command builder
++for single targets and CIDRs. With default ports, the new commands are:
++
++```text
++Quick:
++nmap -sT -n -Pn -T3 --max-retries 1 --host-timeout 30s --top-ports 100 -oX ID.xml.tmp IP...
++
++Standard:
++nmap -sT -n -Pn -T3 --max-retries 1 --host-timeout 60s -sV --version-light --top-ports 1000 -oX ID.xml.tmp IP...
++```
++
++The worker uses an argument list, `shell=False`, captured text output, a bounded
++stderr tail, and a subprocess timeout of 120 seconds for Quick or 300 seconds
++for Standard. IPv6 adds `-6`. Explicit validated ports replace `--top-ports` with
++`-p` and a canonical numeric list. No silent fallback/retry changes the flags.
++
++Quick has no version detection or NSE selection. Standard performs active light
++service/version probing, not a vulnerability assessment. No supported profile
++requests `--script vuln`, `-sC`, `-A`, OS guessing, UDP scans, or credential tests.
++Quick/Standard do not schedule HTTP/Gobuster. The old vulnerability/full profile
++values return HTTP 400 and are disabled visibly in the UI rather than silently
++mapped to a different profile. Existing historical results remain readable.
++
++Nmap's documentation describes [TCP connect scans](https://nmap.org/book/man-port-scanning-techniques.html),
++[top-port coverage](https://nmap.org/book/man-port-specification.html),
++[timeouts/retries](https://nmap.org/book/man-performance.html), and
++[light service detection](https://nmap.org/book/man-version-detection.html).
++`--version-light` means intensity 2, not passive banner viewing or a guarantee
++that no application probes occur. Nmap may use its built-in version-detection
++mechanisms; no generic/vulnerability NSE category is requested.
++
++## Authorization and configuration
++
++- `RISKLENS_ALLOWED_TARGETS` is an operator-configured, comma-separated list of
++  canonical IPs/CIDRs. Empty scope denies every new scan. Private IPs receive no
++  implicit authorization. The request must additionally contain `authorized: true`.
++- Inputs must be literal IPv4/IPv6 addresses, IP:port, HTTP(S) IP origins, or
++  canonical CIDRs. Hostnames, shell/option-like strings, lists in one target,
++  credentials, URL paths, queries, fragments, and zone IDs are rejected.
++- CIDRs have at most 32 total addresses and must be fully contained in approved
++  scope. `ipaddress.hosts()` determines the explicit finite address list. A `.0`
++  address remains a single address. No Angry IP executable/discovery dependency.
++- Mixed IP families, unspecified, multicast, link-local, and reserved targets are
++  unsupported; loopback is permitted if explicitly approved. IPv6 support is
++  limited to literal unicast targets, not zone-scoped discovery.
++- Quick permits at most 100 distinct explicit ports; Standard at most 1,000.
++  Only ascending numeric ports/ranges within 1–65535 are accepted. Conflicting
++  target and body ports are rejected.
++- The saved authorization flag, target list, approved scope, profile, and ports
++  are checked again before the worker runs. One job at a time is admitted per
++  process. A second job receives 409, rather than waiting in an unbounded queue.
++- Nmap resolves from the validated absolute `RISKLENS_NMAP_PATH`, or
++  `shutil.which('nmap')` when unset. Invalid explicit configuration does not fall
++  back. Windows tools must resolve to existing `.exe` files; no batch wrapper or
++  source-code installation path is assumed. Tool identity/provenance is trusted
++  local configuration, not cryptographically verified.
++
++The explicit Web profile remains available only for one approved IP origin and
++one port. It resolves Gobuster through `RISKLENS_GOBUSTER_PATH` or PATH and retains
++the existing project wordlist. Redirect following, insecure HTTP certificate
++fallback, and automatic HTTP-to-HTTPS retry were removed to avoid escaping scope.
++Requests ignores ambient proxies; Gobuster receives an environment without proxy
++variables. Gobuster uses two threads and a 120-second process timeout. A nonzero
++exit fails even with empty stderr or partial output. This is explicit enumeration,
++not part of Quick/Standard.
++
++## Status, JSON storage, and XML
++
++The endpoints and original response fields remain. Request authorization and
++status metadata are additive. The compatibility `/nvd`, report, graph, and other
++read paths remain local and do not start scanning. Existing saved JSON loads
++with defaults for new fields.
++
++```text
++POST /scan -> pending -> running -> completed | failed
++Web only: Nmap success -> nmap_done -> completed | failed (with separate web state)
++```
++
++Status is set by the worker. `GET /scan/{id}` reports it without inferring success
++from files. `completed_at` is set on success/failure. Interrupted pending/running
++jobs are marked failed and persisted at startup; they are never resumed. Clearing
++history during an active job returns 409. JSON status writes share a local lock
++and atomic replace; use one Uvicorn process.
++
++Artifacts stay under [backend/scans](../backend/scans):
++
++- `<id>.xml.tmp`: scanner's working output.
++- `<id>.xml`: final artifact, published by atomic replace only after validation.
++- `<id>.xml.partial`: rejected/interrupted output when present.
++- `nmap_<id>.json`: exact argument list, timeout, authorization/scope, targets,
++  ports, timestamps, exit code, stderr tail, outcome, and artifact reference.
++- `alive_<id>.json`: approved CIDR hosts reported up, for the existing API.
++- `scan_status.json`: existing status/history store plus the additive metadata.
++
++The worker requires exit code zero, parseable XML within 16 MiB, successful Nmap
++run statistics, all requested host addresses, no unexpected addresses/explicit
++TCP ports, and no reported host timeout. Missing hosts are incomplete coverage,
++not closed ports. Invalid output is never published as a new successful artifact.
++Reads reject incomplete XML immediately instead of sleeping. Entity expansion is
++disabled. Recorded open/closed states remain in parsed JSON and are now visible
++in the Services table. Non-open ports are not scored as open exposures or turned
++into findings. An open port alone still does not prove a vulnerability.
++
++HTTP errors before scheduling: 400 invalid input/disabled profile; 403 missing
++authorization/scope or out-of-scope target; 503 bad executable/server scope
++configuration; 409 scanner busy; 500 storage/scheduling failure. After acceptance,
++process errors are reported in saved scan status with diagnostics, not as an HTTP
++exception after the response has already been sent.
++
++## Files changed this day
++
++- [main.py](../backend/main.py): scan entry/worker/status/XML handling; remove Angry
++  discovery and hard-coded tool paths; scope-safe explicit web dispatch.
++- [scan_policy.py](../backend/scanner/scan_policy.py), new: configuration validation,
++  finite targets/ports/scope, and shared Nmap command construction.
++- [app.js](../frontend/static/app.js): send authorization acknowledgement, show API
++  errors and recorded port state.
++- [index.html](../frontend/templates/index.html): authorization checkbox, accurate
++  profile descriptions, disabled intrusive profiles, script cache version 20.
++- [test_read_only_endpoints.py](../tests/test_read_only_endpoints.py): adapt existing
++  synthetic fixtures to explicit scope and the new profile behavior.
++- [test_scan_execution.py](../tests/test_scan_execution.py), new: policy, profile,
++  worker, failure, restart, XML, and explicit-web scope regressions.
++- [README.md](../README.md): configuration, profile semantics, artifacts, and errors.
++- [DAY-03.md](./DAY-03.md): this handoff.
++- [day3-changes.patch](../artifacts/day3-changes.patch): this day's diff against the
++  saved Day 2 state, including the new files. Earlier uncommitted Day 2 work is
++  not included in that patch and was not reverted.
++
++No new packages, database, queue service, framework, AI feature, or live target
++scan was introduced. [run.ps1](../run.ps1) remains compatible with environment
++configuration and localhost binding.
++
++## Exact Windows PowerShell commands
++
++Use the existing working environment. Install development dependencies only if
++not already present:
++
++```powershell
++Set-Location 'D:\security project'
++& '.\.venv-baseline\Scripts\python.exe' -m pip install -r '.\requirements-dev.txt'
++& '.\.venv-baseline\Scripts\python.exe' -B -m unittest discover -s tests -v
++node --check '.\frontend\static\app.js'
++node '.\tests\test_service_details.js'
++git diff --check
++```
++
++Verified here on Python 3.14.3: **29 Python tests pass**, plus the frontend syntax
++and Details-handler checks. The suite exercises real API handlers, XML parsing,
++CSV and PDF exports with synthetic files; every Nmap/Gobuster process is mocked.
++It proves profile flags, scope rejection, resource limits, successful XML/port
++results, timeout, exit/stderr preservation, corrupt/missing/incomplete XML,
++scope revocation, job concurrency, and restart reconciliation. Read-only tests
++still block network requests, DNS, socket connections, and credential calls.
++Editor diagnostics and whitespace checks pass. A pre-existing TemplateResponse
++deprecation warning remains.
++
++To launch after stopping any previously running app, in terminal 1:
++
++```powershell
++Set-Location 'D:\security project'
++$env:RISKLENS_ALLOWED_TARGETS = '127.0.0.1/32'
++# Use this machine's existing installation as explicit configuration:
++$env:RISKLENS_NMAP_PATH = (Resolve-Path 'C:\Program Files (x86)\Nmap\nmap.exe').Path
++# Or, if Nmap is on PATH: Remove-Item Env:RISKLENS_NMAP_PATH
++& '.\.venv-baseline\Scripts\python.exe' -B -m uvicorn backend.main:app --host 127.0.0.1 --port 8787
++```
++
++This does not authorize any LAN or public target. Change the scope only to
++systems for which you have explicit authorization. Another approved IP/CIDR may
++be appended with a comma. Do not start multiple Uvicorn workers. The original
++launcher can instead be used with its expected `.venv` environment.
++
++Optional manual loopback assessment in terminal 2, only when you choose to run a
++real scan of this local app (these requests were not executed during development):
++
++```powershell
++Invoke-RestMethod 'http://127.0.0.1:8787/health'
++$body = @{ target='127.0.0.1'; profile='quick'; ports='8787'; authorized=$true } | ConvertTo-Json
++$scan = Invoke-RestMethod -Method Post 'http://127.0.0.1:8787/scan' -ContentType 'application/json' -Body $body
++$scan.scan_id
++$deadline = (Get-Date).AddSeconds(135)
++do {
++    Start-Sleep -Seconds 1
++    $status = Invoke-RestMethod "http://127.0.0.1:8787/scan/$($scan.scan_id)"
++} while ($status.status -notin @('completed','failed') -and (Get-Date) -lt $deadline)
++$status | Format-List
++if ($status.status -eq 'completed') {
++    $parsed = Invoke-RestMethod "http://127.0.0.1:8787/scan/$($scan.scan_id)/parsed"
++    $parsed.data.hosts.services | Format-Table port,protocol,state,service
++}
++```
++
++Expected when Nmap can reach the running local app: pending/running then
++`completed`, `gobuster_status: skipped`, `nmap_exit_code: 0`, and recorded TCP
++port 8787 `open`. Windows/Npcap, firewall, permissions, and actual listening
++services can change observed results. On error, expect `failed`, a terminal
++timestamp and diagnostic message; inspect `nmap_<id>.json` and any partial XML.
++The client loop itself has a deadline, so it does not poll forever.
++
++## Limits and stop
++
++No actual Nmap/Gobuster process or target scan was executed. Windows binary
++compatibility/Npcap permissions remain an operator verification step; mocked
++success is not proof of real network reachability. Service/version detection is
++active and can be misidentified; a host timeout or missing XML is an incomplete
++assessment. IPv6 zone-scoped targets and hostname resolution are intentionally
++unsupported. TCP-only coverage, 32-address cap, and one-process/one-job operation
++are deliberate MVP limits. Explicit web HTTP/socket operations retain their
++per-operation timeouts; only Nmap and Gobuster have hard process deadlines.
++
++Reports, historical JSON/XML, deterministic remediation, and the no-hidden-read
++activity protections remain. Broader findings rules and the Exposure Change
++Detector are outside this day. Stop here.

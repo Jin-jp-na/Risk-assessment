@@ -1,0 +1,915 @@
+diff --git a/backend/main.py b/backend/main.py
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -10,9 +10,6 @@
+ import ipaddress
+ import json
+ import hashlib
+-import socket
+-import ssl
+-import requests
+ from urllib.parse import urlparse
+ from pathlib import Path
+ from pydantic import BaseModel, Field
+@@ -20,6 +17,7 @@
+     ConfigurationError, ScopeError, PROFILES, validate_request, validate_targets,
+     normalize_ports, resolve_executable, nmap_command,
+ )
++from backend.scanner.web_assessment import assess_web_url, validate_web_url
+ from backend.scanner.pcvp_scoring import pcvp_score_for_service
+ from backend.scanner.network_findings import normalized_observation, normalize_nvd_candidates, build_network_findings
+ from backend.scanner.attack_graph import build_attack_graph
+@@ -268,97 +266,8 @@
+ 
+ 
+ def run_web_security_assessment(url: str) -> dict:
+-    parsed_url = urlparse(url)
+-    if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
+-        return {"url": url, "error": "Unsupported web URL."}
+-    validate_targets([parsed_url.hostname])
+-
+-    result = {
+-        "url": url,
+-        "http": {},
+-        "tls": {},
+-        "technologies": [],
+-        "checks": [],
+-    }
+-
+-    response = None
+-    request_error = None
+-    try:
+-        with requests.Session() as session:
+-            session.trust_env = False
+-            response = session.get(url, timeout=15, allow_redirects=False, verify=True)
+-    except requests.RequestException as exc:
+-        request_error = str(exc)
+-
+-    if response is not None:
+-        headers = {key.lower(): value for key, value in response.headers.items()}
+-        result["http"] = {
+-            "status": response.status_code,
+-            "final_url": response.url,
+-            "headers": dict(response.headers),
+-        }
+-        body_sample = response.text[:200000].lower()
+-        technology_signatures = {
+-            "Server": headers.get("server"),
+-            "Powered-By": headers.get("x-powered-by"),
+-            "WordPress": "wp-content" if "wp-content" in body_sample else None,
+-            "React": "react" if "react" in body_sample else None,
+-            "jQuery": "jquery" if "jquery" in body_sample else None,
+-        }
+-        result["technologies"] = [
+-            {"name": name, "evidence": evidence}
+-            for name, evidence in technology_signatures.items()
+-            if evidence
+-        ]
+-        security_headers = {
+-            "strict-transport-security": "HSTS",
+-            "content-security-policy": "Content-Security-Policy",
+-            "x-content-type-options": "X-Content-Type-Options",
+-            "x-frame-options": "X-Frame-Options",
+-            "referrer-policy": "Referrer-Policy",
+-            "permissions-policy": "Permissions-Policy",
+-        }
+-        for header_name, label in security_headers.items():
+-            present = header_name in headers
+-            result["checks"].append({
+-                "name": label,
+-                "status": "pass" if present else "missing",
+-                "detail": "Header present" if present else "Security header is missing",
+-            })
+-        if "server" in headers:
+-            result["checks"].append({
+-                "name": "Server disclosure",
+-                "status": "review",
+-                "detail": f"Server header is exposed: {headers['server']}",
+-            })
+-        if request_error:
+-            result["checks"].append({
+-                "name": "TLS validation",
+-                "status": "review",
+-                "detail": request_error,
+-            })
+-    else:
+-        result["error"] = request_error or "HTTP request failed."
+-
+-    if parsed_url.scheme == "https" and parsed_url.hostname:
+-        try:
+-            port = parsed_url.port or 443
+-            context = ssl._create_unverified_context()
+-            with socket.create_connection((parsed_url.hostname, port), timeout=10) as raw_socket:
+-                with context.wrap_socket(raw_socket, server_hostname=parsed_url.hostname) as tls_socket:
+-                    certificate = tls_socket.getpeercert() or {}
+-                    cipher = tls_socket.cipher()
+-                    result["tls"] = {
+-                        "protocol": tls_socket.version(),
+-                        "cipher": cipher[0] if cipher else None,
+-                        "subject": str(certificate.get("subject", "")),
+-                        "issuer": str(certificate.get("issuer", "")),
+-                        "expires": certificate.get("notAfter"),
+-                    }
+-        except (OSError, ssl.SSLError) as exc:
+-            result["tls"] = {"error": str(exc)}
+-
+-    return result
++    """Retain the public helper and original JSON fields; use one verified connection."""
++    return assess_web_url(url)
+ 
+ 
+ @asynccontextmanager
+@@ -448,6 +357,7 @@
+         plan = validate_request(request.target, request.ports, request.profile)
+         resolve_executable("RISKLENS_NMAP_PATH", "nmap")
+         if plan["web_url"]:
++            validate_web_url(plan["web_url"], plan["scope"])
+             resolve_executable("RISKLENS_GOBUSTER_PATH", "gobuster")
+             if not GOBUSTER_WORDLIST.is_file():
+                 raise ConfigurationError("Gobuster wordlist is missing")
+@@ -683,19 +593,19 @@
+ def build_findings(parsed: dict, web_assessment: Optional[dict] = None) -> list[dict]:
+     findings = build_network_findings(parsed)
+     for check in (web_assessment or {}).get("checks", []):
+-        if check.get("status") == "missing":
++        if check.get("status") in {"missing", "misconfigured"}:
+             findings.append({
+                 "id": f"WEB-{check.get('name', 'header').replace(' ', '-').upper()}",
+-                "title": f"Missing web security control: {check.get('name')}",
+-                "severity": "medium",
++                "title": f"Web configuration observation: {check.get('name')} ({check.get('status')})",
++                "severity": "info",
+                 "confidence": "high",
+                 "asset": (web_assessment or {}).get("url", "web target"),
+                 "evidence": check.get("detail", ""),
+                 "remediation": f"Configure the {check.get('name')} response header.",
+                 "source": "HTTP assessment",
+-                "domain": "web", "category": "hardening_recommendation",
++                "domain": "web", "category": "configuration_observation",
+                 "rule_id": "WEB-HEADER-001", "verification_status": "observed",
+-                "reason": "A saved HTTP assessment recorded a missing response header; application context requires review.",
++                "reason": "A saved HTTP response recorded a missing or misconfigured header; exploitation and application impact are not established.",
+             })
+     rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+     return sorted(findings, key=lambda item: (rank.get(item["severity"], 0), float(item.get("cvss") or 0)), reverse=True)
+@@ -820,7 +730,7 @@
+ 
+     try:
+         host = urlparse(url).hostname
+-        if scan_st is None or scan_st.nmap_status != "completed":
++        if scan_st is None or not scan_st.authorized or scan_st.nmap_status != "completed":
+             raise ScopeError("Web assessment requires a completed authorized network scan")
+         validate_targets([host], scan_st.approved_scope)
+         if host not in scan_st.authorized_targets:
+@@ -828,7 +738,11 @@
+         validate_request(url, scan_st.ports, "web")
+         audit_path = SCANS_DIR / f"web_audit_{scan_id}.json"
+         audit = run_web_security_assessment(url)
+-        audit_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
++        temporary_audit = audit_path.with_suffix(".json.tmp")
++        temporary_audit.write_text(json.dumps(audit, indent=2), encoding="utf-8")
++        temporary_audit.replace(audit_path)
++        if audit.get("error"):
++            raise RuntimeError(f"{audit.get('error_category', 'assessment_error')}: {audit['error']}")
+ 
+         urls = [url]
+ 
+diff --git a/frontend/static/app.js b/frontend/static/app.js
+--- a/frontend/static/app.js
++++ b/frontend/static/app.js
+@@ -712,15 +712,18 @@
+       : "<li>No HTTP checks returned.</li>";
+     const technologyText = technologies.length
+       ? technologies.map(item => `${item.name}: ${item.evidence}`).join(", ")
+-      : "No technology signatures detected";
++      : "No technology evidence recorded";
+     container.innerHTML = `
+       <div><strong>Final URL:</strong> ${escapeHtml(data.http?.final_url || data.url || "")}</div>
+       <div><strong>HTTP status:</strong> ${escapeHtml(data.http?.status ?? "Unavailable")}</div>
+       <div><strong>Technologies:</strong> ${escapeHtml(technologyText)}</div>
+-      <div><strong>TLS:</strong> ${escapeHtml(tls.protocol || "Not HTTPS")} ${tls.cipher ? `(${escapeHtml(tls.cipher)})` : ""}</div>
+-      <div class="section-title">Security checks</div>
++      <div><strong>Assessment:</strong> ${escapeHtml(data.status || "Saved assessment (legacy)")}</div>
++      <div><strong>TLS:</strong> ${escapeHtml(tls.protocol || (String(data.url || "").startsWith("https:") ? "Unavailable" : "Not HTTPS"))} ${tls.cipher ? `(${escapeHtml(tls.cipher)})` : ""}; verification: ${escapeHtml(tls.verification || "Not recorded")}</div>
++      ${tls.subject ? `<div><strong>Certificate:</strong> ${escapeHtml(tls.subject)}; issuer: ${escapeHtml(tls.issuer || "")}; expires: ${escapeHtml(tls.expires || "Not recorded")}</div>` : ""}
++      <details><summary>Saved HTTP/TLS evidence and redirect decisions</summary><pre>${escapeHtml(JSON.stringify({http: data.http || {}, tls, redirects: data.redirects || []}, null, 2))}</pre></details>
++      <div class="section-title">Configuration observations (impact requires review)</div>
+       <ul>${checkRows}</ul>
+-      ${data.error ? `<div style="color:#fca5a5;">${escapeHtml(data.error)}</div>` : ""}
++      ${data.error ? `<div style="color:#fca5a5;">${escapeHtml(data.error_category || "Assessment error")}: ${escapeHtml(data.error)}</div>` : ""}
+     `;
+   } catch (err) {
+     console.error("[loadWebAssessment] Error:", err);
+diff --git a/tests/test_scan_execution.py b/tests/test_scan_execution.py
+--- a/tests/test_scan_execution.py
++++ b/tests/test_scan_execution.py
+@@ -238,16 +238,11 @@
+         message = json.loads((self.directory / f"gobuster_{fixtures.SCAN_ID}.status").read_text())
+         self.assertIn("code 9", message["detail"])
+ 
+-    def test_web_assessment_does_not_follow_redirects_or_use_proxies(self):
+-        response = Mock(status_code=302, url="http://192.0.2.10:8080", text="",
+-                        headers={"Location": "https://outside.example/"})
+-        with patch.object(main.requests, "Session") as session_type:
+-            session = session_type.return_value.__enter__.return_value
+-            session.get.return_value = response
+-            result = main.run_web_security_assessment(response.url)
+-            self.assertFalse(session.trust_env)
+-            session.get.assert_called_once_with(response.url, timeout=15, allow_redirects=False, verify=True)
+-            self.assertEqual(result["http"]["status"], 302)
++    def test_web_assessment_wrapper_preserves_public_helper(self):
++        audit = {"url": "http://192.0.2.10:8080", "http": {}, "tls": {}, "checks": [], "technologies": []}
++        with patch.object(main, "assess_web_url", return_value=audit) as assess:
++            self.assertEqual(main.run_web_security_assessment(audit["url"]), audit)
++            assess.assert_called_once_with(audit["url"])
+         self.assert_no_external_io()
+ 
+ 
+diff --git a/backend/scanner/web_assessment.py b/backend/scanner/web_assessment.py
+new file mode 100644
+--- /dev/null
++++ b/backend/scanner/web_assessment.py
+@@ -0,0 +1,204 @@
++"""One bounded HTTP request to an approved literal IP; no DNS, proxy or redirects."""
++
++import hashlib
++import http.client
++import ipaddress
++import os
++import re
++import socket
++import ssl
++import time
++from urllib.parse import urlsplit, urljoin
++
++from backend.scanner.scan_policy import ConfigurationError, ScopeError, validate_targets
++
++CONNECT_TIMEOUT = 5
++READ_TIMEOUT = 10
++TOTAL_TIMEOUT = 20
++BODY_LIMIT = 200_000
++
++
++def validate_web_url(url, scope=None):
++    if not isinstance(url, str) or len(url) > 2048 or any(ord(c) <= 32 or ord(c) == 127 for c in url):
++        raise ValueError("URL must contain no whitespace/control characters and be at most 2048 characters")
++    parsed = urlsplit(url)
++    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username is not None
++            or parsed.password is not None or parsed.fragment or "%" in parsed.netloc or "\\" in url
++            or parsed.netloc.endswith(":")):
++        raise ValueError("Use an HTTP/HTTPS literal-IP URL without credentials, fragments or zone IDs")
++    # Deliberately no hostname resolution: keep the existing IP-only scan policy.
++    host = str(ipaddress.ip_address(parsed.hostname))
++    validate_targets([host], scope)
++    port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
++    configured = os.environ.get("RISKLENS_ALLOWED_WEB_PORTS", "80,443,8080,8443")
++    if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", configured):
++        raise ConfigurationError("RISKLENS_ALLOWED_WEB_PORTS must be a comma-separated list of ports")
++    allowed = {int(item) for item in configured.split(",")}
++    if any(not 1 <= number <= 65535 for number in allowed):
++        raise ConfigurationError("RISKLENS_ALLOWED_WEB_PORTS ports must be within 1-65535")
++    if port not in allowed:
++        raise ScopeError(f"Web port {port} is outside RISKLENS_ALLOWED_WEB_PORTS")
++    return parsed, host, port
++
++
++class _PinnedConnection(http.client.HTTPConnection):
++    def __init__(self, host, port, scheme, scope, deadline):
++        super().__init__(host, port, timeout=CONNECT_TIMEOUT)
++        self.scheme, self.scope, self.deadline = scheme, scope, deadline
++        self.tls_evidence = {}
++
++    def connect(self):
++        validate_targets([self.host], self.scope)  # recheck operator scope immediately before connecting
++        address = ipaddress.ip_address(self.host)
++        raw = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET, socket.SOCK_STREAM)
++        self.sock = raw
++        try:
++            raw.settimeout(min(CONNECT_TIMEOUT, max(0.001, self.deadline - time.monotonic())))
++            raw.connect((self.host, self.port))  # numeric address; no getaddrinfo or DNS rebinding
++            if ipaddress.ip_address(raw.getpeername()[0]) != address:
++                raise ScopeError("Connected peer differs from the approved IP")
++            if self.scheme == "https":
++                context = ssl.create_default_context()  # CERT_REQUIRED and hostname/IP SAN verification
++                self.sock = context.wrap_socket(raw, server_hostname=self.host)
++                cert = self.sock.getpeercert()
++                cipher = self.sock.cipher()
++                self.tls_evidence = {
++                    "verification": "verified", "protocol": self.sock.version(),
++                    "cipher": cipher[0] if cipher else None,
++                    "subject": str(cert.get("subject", "")), "issuer": str(cert.get("issuer", "")),
++                    "expires": cert.get("notAfter"), "not_before": cert.get("notBefore"),
++                    "serial_number": cert.get("serialNumber"), "subject_alt_names": cert.get("subjectAltName", []),
++                    "certificate_sha256": hashlib.sha256(self.sock.getpeercert(binary_form=True)).hexdigest(),
++                    "source": "same verified connection as HTTP request",
++                }
++            self.sock.settimeout(READ_TIMEOUT)
++        except BaseException:
++            self.close()
++            raise
++
++
++def _header_checks(headers, scheme):
++    labels = {"strict-transport-security": "HSTS", "content-security-policy": "Content-Security-Policy",
++              "x-content-type-options": "X-Content-Type-Options", "x-frame-options": "X-Frame-Options",
++              "referrer-policy": "Referrer-Policy", "permissions-policy": "Permissions-Policy"}
++    checks = []
++    for header, label in labels.items():
++        value = headers.get(header)
++        status = "missing" if value is None else "review"
++        detail = f"{header}: {value}" if value is not None else f"{header} absent from this response"
++        if header == "strict-transport-security" and scheme == "http":
++            status, detail = "not_applicable", "HSTS is effective only over verified HTTPS"
++        elif value is not None:
++            invalid = not value.strip()
++            if header == "x-content-type-options":
++                invalid = value.strip().lower() != "nosniff"
++            elif header == "x-frame-options":
++                invalid = value.strip().lower() not in {"deny", "sameorigin"}
++            elif header == "strict-transport-security":
++                age = re.search(r"(?:^|;)\s*max-age\s*=\s*([0-9]+)\s*(?:;|$)", value, re.I)
++                invalid = age is None or int(age.group(1)) == 0
++            elif header == "referrer-policy":
++                valid = {"no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin",
++                         "same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url"}
++                invalid = not any(item.strip().lower() in valid for item in value.split(","))
++            if invalid:
++                status = "misconfigured"
++        checks.append({"name": label, "status": status, "detail": detail,
++                       "category": "configuration_observation", "severity": "info",
++                       "reason": "Response configuration only; application impact and exploitation are not established."})
++    return checks
++
++
++def assess_web_url(url, scope=None):
++    # Original fields always exist, including on failure. Additional fields are additive.
++    result = {"url": url, "http": {}, "tls": {}, "technologies": [], "checks": [],
++              "status": "failed", "redirects": []}
++    conn = None
++    phase = "validation"
++    try:
++        parsed, host, port = validate_web_url(url, scope)
++        result["tls"] = {"verification": "not_attempted" if parsed.scheme == "https" else "not_applicable"}
++        deadline = time.monotonic() + TOTAL_TIMEOUT
++        conn = _PinnedConnection(host, port, parsed.scheme, scope, deadline)
++        phase = "connect"
++        conn.connect()
++        result["tls"] = conn.tls_evidence or result["tls"]
++        phase = "read"
++        conn.sock.settimeout(min(READ_TIMEOUT, max(0.001, deadline - time.monotonic())))
++        conn.request("GET", (parsed.path or "/") + ("?" + parsed.query if parsed.query else ""),
++                     headers={"User-Agent": "RiskLens/2.0", "Accept-Encoding": "identity", "Connection": "close"})
++        read_socket = conn.sock
++        response = conn.getresponse()
++        raw_headers = response.getheaders()
++        headers = {}
++        for key, value in raw_headers:
++            key = key.lower()
++            headers[key] = headers[key] + ", " + value if key in headers else value
++        result["http"] = {"status": response.status, "final_url": url, "headers": headers,
++                          "raw_headers": raw_headers, "body_bytes_sampled": 0}
++        result["checks"] = _header_checks(headers, parsed.scheme)
++        if 300 <= response.status < 400 and "location" in headers:
++            decision = {"from": url, "location": headers["location"], "to": None,
++                        "followed": False, "status": response.status}
++            result["redirects"].append(decision)
++            try:
++                destination = urljoin(url, headers["location"])
++                decision["to"] = destination
++                redirect, next_host, next_port = validate_web_url(destination, scope)
++                if (redirect.scheme, next_host, next_port) != (parsed.scheme, host, port):
++                    raise ScopeError("Redirect changes the explicitly approved origin")
++                decision["decision"] = "same_origin_not_followed"
++            except (ValueError, ConfigurationError) as exc:
++                decision["decision"] = "blocked"
++                result.update(status="partial", error_category="redirect_scope_blocked", error=str(exc))
++        # No body is needed for redirects; never request their destination.
++        sample = bytearray()
++        if not 300 <= response.status < 400:
++            while len(sample) < BODY_LIMIT:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError("Assessment time budget exceeded")
++                read_socket.settimeout(min(READ_TIMEOUT, remaining))
++                chunk = response.read1(min(8192, BODY_LIMIT - len(sample)))
++                if not chunk:
++                    break
++                sample.extend(chunk)
++                result["http"]["body_bytes_sampled"] = len(sample)
++            result["http"].update(body_bytes_sampled=len(sample), body_limit_reached=len(sample) == BODY_LIMIT)
++        body = sample.decode("utf-8", errors="replace").lower()
++        signatures = {"Server": headers.get("server"), "Powered-By": headers.get("x-powered-by"),
++                      "WordPress": "wp-content" if "wp-content" in body else None,
++                      "React": "react" if "react" in body else None,
++                      "jQuery": "jquery" if "jquery" in body else None}
++        result["technologies"] = [{"name": name, "evidence": evidence} for name, evidence in signatures.items() if evidence]
++        if not result.get("error"):
++            result["status"] = "completed"
++    except Exception as exc:
++        if isinstance(exc, ssl.SSLCertVerificationError):
++            category = "certificate_verification_failed"
++            result["tls"] = {"verification": "failed", "error": str(exc),
++                             "verify_code": getattr(exc, "verify_code", None)}
++        elif isinstance(exc, ssl.SSLError):
++            category = "tls_error"
++            result["tls"] = {"verification": "failed", "error": str(exc)}
++        elif isinstance(exc, TimeoutError):
++            category = "connect_timeout" if phase == "connect" else "read_timeout"
++        elif isinstance(exc, ConfigurationError):
++            category = "configuration_error"
++        elif isinstance(exc, ScopeError):
++            category = "scope_rejected"
++        elif isinstance(exc, ValueError):
++            category = "invalid_url"
++        elif isinstance(exc, ConnectionRefusedError):
++            category = "connection_refused"
++        elif isinstance(exc, http.client.HTTPException):
++            category = "http_protocol_error"
++        elif isinstance(exc, OSError):
++            category = "connection_error"
++        else:
++            category = "assessment_error"
++        result.update(status="partial" if result["http"] else "failed", error_category=category, error=str(exc))
++    finally:
++        if conn is not None:
++            conn.close()
++    return result
+diff --git a/tests/test_web_assessment.py b/tests/test_web_assessment.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_web_assessment.py
+@@ -0,0 +1,208 @@
++"""Exercise real assessment/transport code using synthetic sockets and HTTP responses."""
++
++import json
++import os
++import socket
++import ssl
++from unittest.mock import Mock, patch
++
++import test_read_only_endpoints as fixtures
++from backend.scanner import web_assessment as web
++
++
++class WebAssessmentTest(fixtures.SavedScanFixture):
++    def setUp(self):
++        super().setUp()
++        self.stack.enter_context(patch.dict(os.environ, {"RISKLENS_ALLOWED_WEB_PORTS": "80,443,8080,8443"}))
++        self.raw = Mock()
++        self.raw.getpeername.return_value = ("127.0.0.1", 443)
++        # Replace only this module's socket namespace. Patching the global socket
++        # class breaks Windows asyncio's isinstance checks in the ASGI test client.
++        self.socket_type = Mock(return_value=self.raw)
++        self.stack.enter_context(patch.object(web, "socket", Mock(
++            socket=self.socket_type, AF_INET=socket.AF_INET, AF_INET6=socket.AF_INET6,
++            SOCK_STREAM=socket.SOCK_STREAM)))
++        self.request = self.stack.enter_context(patch.object(web.http.client.HTTPConnection, "request"))
++        self.response = Mock(status=200)
++        self.response.getheaders.return_value = [("Server", "synthetic"), ("X-Content-Type-Options", "wrong")]
++        self.response.read1.side_effect = [b"wp-content", b""]
++        self.getresponse = self.stack.enter_context(patch.object(
++            web.http.client.HTTPConnection, "getresponse", return_value=self.response))
++        self.context = ssl.create_default_context()
++        self.context_type = self.stack.enter_context(patch.object(web.ssl, "create_default_context", return_value=self.context))
++        self.tls = Mock()
++        self.tls.version.return_value = "TLSv1.3"
++        self.tls.cipher.return_value = ("TLS_AES_256_GCM_SHA384", "TLSv1.3", 256)
++        certificate = {"subject": ((('commonName', 'synthetic'),),), "issuer": ((('commonName', 'local test CA'),),),
++                       "notAfter": "Jan 1 00:00:00 2030 GMT", "serialNumber": "1234",
++                       "subjectAltName": (("IP Address", "127.0.0.1"),)}
++        self.tls.getpeercert.side_effect = lambda binary_form=False: b"synthetic DER" if binary_form else certificate
++        self.wrap = self.stack.enter_context(patch.object(self.context, "wrap_socket", return_value=self.tls))
++
++    def assess(self, url="https://127.0.0.1/"):
++        result = fixtures.main.run_web_security_assessment(url)
++        self.assert_no_external_io()
++        self.assertTrue({"url", "http", "tls", "technologies", "checks"}.issubset(result))
++        return result
++
++    def test_success_captures_normalized_headers_and_verified_same_connection_tls(self):
++        result = self.assess()
++        self.assertEqual(result["status"], "completed")
++        self.assertEqual(result["http"]["status"], 200)
++        self.assertEqual(result["http"]["headers"]["server"], "synthetic")
++        self.assertEqual(result["http"]["body_bytes_sampled"], 10)
++        self.assertEqual(result["tls"]["protocol"], "TLSv1.3")
++        self.assertEqual(result["tls"]["verification"], "verified")
++        self.assertEqual(result["tls"]["serial_number"], "1234")
++        self.assertEqual(len(result["tls"]["certificate_sha256"]), 64)
++        self.assertTrue(self.context.check_hostname)
++        self.assertEqual(self.context.verify_mode, ssl.CERT_REQUIRED)
++        self.wrap.assert_called_once_with(self.raw, server_hostname="127.0.0.1")
++        self.raw.connect.assert_called_once_with(("127.0.0.1", 443))
++        self.raw.settimeout.assert_any_call(web.CONNECT_TIMEOUT)
++        self.assertIn({"name": "WordPress", "evidence": "wp-content"}, result["technologies"])
++        bad = next(check for check in result["checks"] if check["name"] == "X-Content-Type-Options")
++        self.assertEqual((bad["status"], bad["severity"]), ("misconfigured", "info"))
++
++    def test_invalid_certificate_no_insecure_retry_or_header_findings(self):
++        self.wrap.side_effect = ssl.SSLCertVerificationError(1, "certificate verify failed")
++        result = self.assess()
++        self.assertEqual(result["error_category"], "certificate_verification_failed")
++        self.assertEqual(result["tls"]["verification"], "failed")
++        self.assertEqual(result["http"], {})
++        self.assertEqual(result["checks"], [])
++        self.assertNotIn("protocol", result["tls"])
++        self.wrap.assert_called_once()
++        self.request.assert_not_called()
++        self.raw.close.assert_called()
++
++    def test_external_redirect_preserves_status_and_never_connects_to_destination(self):
++        self.response.status = 302
++        self.response.getheaders.return_value = [("Location", "https://outside.example/")]
++        result = self.assess()
++        self.assertEqual(result["http"]["status"], 302)
++        self.assertEqual(result["http"]["final_url"], "https://127.0.0.1/")
++        self.assertEqual(result["error_category"], "redirect_scope_blocked")
++        self.assertEqual(result["redirects"][0]["decision"], "blocked")
++        self.assertFalse(result["redirects"][0]["followed"])
++        self.raw.connect.assert_called_once()
++        self.request.assert_called_once()
++        self.response.read1.assert_not_called()
++
++    def test_same_origin_redirect_is_recorded_without_following(self):
++        self.response.status = 301
++        self.response.getheaders.return_value = [("Location", "/login")]
++        result = self.assess()
++        self.assertEqual(result["status"], "completed")
++        self.assertEqual(result["redirects"][0]["decision"], "same_origin_not_followed")
++        self.assertEqual(result["redirects"][0]["to"], "https://127.0.0.1/login")
++        self.request.assert_called_once()
++
++    def test_approved_different_ip_or_port_or_https_downgrade_is_still_blocked(self):
++        for destination in ("https://[::1]/", "https://127.0.0.1:8443/", "http://127.0.0.1/"):
++            with self.subTest(destination=destination):
++                self.response.status = 302
++                self.response.getheaders.return_value = [("Location", destination)]
++                self.assertEqual(self.assess()["error_category"], "redirect_scope_blocked")
++
++    def test_connect_timeout(self):
++        self.raw.connect.side_effect = TimeoutError("synthetic connect timeout")
++        result = self.assess()
++        self.assertEqual(result["error_category"], "connect_timeout")
++        self.assertEqual(result["http"], {})
++        self.request.assert_not_called()
++
++    def test_read_timeout_without_http_response(self):
++        self.getresponse.side_effect = TimeoutError("synthetic read timeout")
++        result = self.assess()
++        self.assertEqual(result["error_category"], "read_timeout")
++        self.assertEqual(result["checks"], [])
++        self.assertEqual(result["tls"]["verification"], "verified")
++
++    def test_body_timeout_preserves_observed_http_and_tls(self):
++        self.response.read1.side_effect = [b"part", TimeoutError("synthetic body timeout")]
++        result = self.assess()
++        self.assertEqual(result["status"], "partial")
++        self.assertEqual(result["http"]["status"], 200)
++        self.assertEqual(result["http"]["body_bytes_sampled"], 4)
++        self.assertEqual(result["error_category"], "read_timeout")
++
++    def test_body_sampling_is_bounded(self):
++        self.response.read1.side_effect = lambda size: b"x" * size
++        result = self.assess()
++        self.assertEqual(result["http"]["body_bytes_sampled"], web.BODY_LIMIT)
++        self.assertTrue(result["http"]["body_limit_reached"])
++
++    def test_invalid_url_scope_or_port_never_connects(self):
++        for url in ("ftp://127.0.0.1/", "http://localhost/", "http://user:pass@127.0.0.1/",
++                    "http://127.0.0.1:9000/", "http://198.51.100.1/", "http://127.0.0.1:0/",
++                    "http://127.0.0.1/\r\nx: y", "http://127.0.0.1/#fragment"):
++            with self.subTest(url=url):
++                self.assertEqual(self.assess(url)["status"], "failed")
++        self.socket_type.assert_not_called()
++
++    def test_connected_peer_must_match_approved_ip(self):
++        self.raw.getpeername.return_value = ("198.51.100.1", 443)
++        self.assertEqual(self.assess()["error_category"], "scope_rejected")
++        self.wrap.assert_not_called()
++        self.request.assert_not_called()
++
++    def test_http_records_no_tls_and_hsts_not_applicable(self):
++        result = self.assess("http://127.0.0.1/")
++        self.assertEqual(result["tls"]["verification"], "not_applicable")
++        self.context_type.assert_not_called()
++        self.assertEqual(result["checks"][0]["status"], "not_applicable")
++
++    def test_failed_saved_assessment_is_returned_without_network_or_rescan(self):
++        self.wrap.side_effect = ssl.SSLCertVerificationError(1, "certificate verify failed")
++        failure = self.assess()
++        (self.directory / f"web_audit_{fixtures.SCAN_ID}.json").write_text(json.dumps(failure), encoding="utf-8")
++        before = self.socket_type.call_count
++        self.assertEqual(self.client.get(f"/webscan/{fixtures.SCAN_ID}/assessment").json(), failure)
++        self.assertEqual(self.socket_type.call_count, before)
++        self.assert_no_external_io()
++
++    def test_connection_refused_is_truthful_failure(self):
++        self.raw.connect.side_effect = ConnectionRefusedError("synthetic refused connection")
++        result = self.assess()
++        self.assertEqual(result["error_category"], "connection_refused")
++        self.assertEqual(result["http"], {})
++        self.assertEqual(result["checks"], [])
++
++    def test_invalid_port_configuration_never_connects(self):
++        with patch.dict(os.environ, {"RISKLENS_ALLOWED_WEB_PORTS": "443,not-a-port"}):
++            self.assertEqual(self.assess()["error_category"], "configuration_error")
++        self.socket_type.assert_not_called()
++
++    def test_revoked_scope_is_rechecked_before_connect(self):
++        from backend.scanner.scan_policy import validate_targets
++        with patch.object(web, "validate_targets", side_effect=[
++            validate_targets(["127.0.0.1"]), web.ScopeError("Scope revoked before connecting")
++        ]):
++            self.assertEqual(self.assess()["error_category"], "scope_rejected")
++        self.socket_type.assert_not_called()
++
++    def test_post_rejects_disallowed_web_port_before_job_starts(self):
++        response = self.client.post("/scan", json={"target": "http://127.0.0.1:9000", "profile": "web", "authorized": True})
++        self.assertEqual(response.status_code, 403)
++        self.assertIn("RISKLENS_ALLOWED_WEB_PORTS", response.text)
++        self.socket_type.assert_not_called()
++        self.assert_no_external_io()
++
++    def test_worker_persists_failure_and_does_not_start_gobuster(self):
++        fixtures.main.scan_status_store[fixtures.SCAN_ID].nmap_status = "completed"
++        failure = {"url": "https://192.0.2.10:8080", "http": {}, "tls": {}, "checks": [],
++                   "technologies": [], "error_category": "certificate_verification_failed", "error": "invalid certificate"}
++        with patch.object(fixtures.main, "run_web_security_assessment", return_value=failure):
++            fixtures.main.run_gobuster_scan(fixtures.SCAN_ID, failure["url"])
++        self.assertEqual(fixtures.main.scan_status_store[fixtures.SCAN_ID].gobuster_status, "failed")
++        self.assertEqual(self.client.get(f"/webscan/{fixtures.SCAN_ID}/assessment").json(), failure)
++        self.assert_no_external_io()
++
++    def test_header_findings_are_configuration_observations(self):
++        findings = fixtures.main.build_findings({"hosts": []}, self.assess())
++        self.assertTrue(findings)
++        for finding in findings:
++            self.assertEqual(finding["severity"], "info")
++            self.assertEqual(finding["category"], "configuration_observation")
++            self.assertIn("exploitation", finding["reason"])
+diff --git a/tests/test_web_assessment.js b/tests/test_web_assessment.js
+new file mode 100644
+--- /dev/null
++++ b/tests/test_web_assessment.js
+@@ -0,0 +1,33 @@
++// Render the actual saved-assessment reader without a server or target requests.
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++const container = {innerHTML: "", textContent: ""};
++let data;
++const calls = [];
++const context = vm.createContext({
++  document: {addEventListener() {}, getElementById() {return container;}},
++  async fetch(url) {
++    calls.push(url);
++    return {ok: true, async json() {return data;}};
++  },
++});
++vm.runInContext(fs.readFileSync(path.join(__dirname, "../frontend/static/app.js"), "utf8"), context);
++(async () => {
++  data = {url: "https://127.0.0.1/", http: {}, tls: {verification: "failed"}, checks: [],
++    error_category: "certificate_verification_failed", error: "Untrusted <certificate>"};
++  await vm.runInContext('loadWebAssessment("saved")', context);
++  assert.match(container.innerHTML, /Unavailable/);
++  assert.match(container.innerHTML, /certificate_verification_failed/);
++  assert.match(container.innerHTML, /Untrusted &lt;certificate&gt;/);
++  assert.doesNotMatch(container.innerHTML, /Not HTTPS/);
++  data = {url: "http://127.0.0.1/", http: {status: 302, headers: {location: "http://outside.example/"}},
++    tls: {verification: "not_applicable"}, checks: [], redirects: [{followed: false, decision: "blocked"}]};
++  await vm.runInContext('loadWebAssessment("saved")', context);
++  assert.match(container.innerHTML, /302/);
++  assert.match(container.innerHTML, /blocked/);
++  assert.match(container.innerHTML, /Configuration observations/);
++  assert.deepEqual(calls, ["/webscan/saved/assessment", "/webscan/saved/assessment"]);
++  console.log("PASS: saved web evidence and HTTPS failures render truthfully");
++})().catch(error => {console.error(error); process.exitCode = 1;});
+diff --git a/docs/DAY-05.md b/docs/DAY-05.md
+new file mode 100644
+--- /dev/null
++++ b/docs/DAY-05.md
+@@ -0,0 +1,223 @@
++# Day 5 — truthful, scoped HTTP/TLS evidence
++
++## Actual execution path and original contract
++
++Inspected the working source before editing, rather than assuming the ZIP's
++original implementation still applied after Days 2–4:
++
++`POST /scan` → authorized Web profile → Nmap completes →
++`run_gobuster_scan()` → `run_web_security_assessment(url)` →
++`backend/scans/web_audit_<scan_id>.json` → Gobuster.
++`GET /webscan/{scan_id}/assessment` only reads that saved JSON.
++The frontend `loadWebAssessment()` fetches that endpoint when showing results.
++
++The original successful response structure, taken from the function's code, was:
++
++```text
++{
++  url: string,
++  http: {status: integer, final_url: string, headers: object},
++  tls: {protocol, cipher, subject, issuer, expires} or {error} or {},
++  technologies: [{name, evidence}],
++  checks: [{name, status, detail}],
++  error?: string
++}
++```
++
++HTTP failure left `http` empty. Unsupported URLs returned only `{url, error}`.
++The HTTP request used Requests with verification enabled, redirects disabled,
++environment proxies disabled, and a 15-second timeout. A separate TLS connection
++then used `ssl._create_unverified_context()`, so its metadata did not establish
++that the HTTP connection was verified. HTTP headers were stored with original
++casing, redirect decisions were absent, and header presence alone produced a
++`pass`. The frontend could label an HTTPS failure “Not HTTPS”. The worker could
++continue into Gobuster after an assessment error.
++
++Plan implemented: keep the wrapper, endpoint, artifact name, and original JSON
++fields; isolate transport and evidence logic in one new module; replace both
++connections with one verified, pinned connection; add deterministic checks and
++mocked regressions. No new dependency or schema version is required.
++
++## Files changed today
++
++- [backend/main.py](../backend/main.py): assessment wrapper, submission-time web
++  URL/port policy, worker authorization check, atomic audit publication and stop
++  on assessment error, informational web configuration findings.
++- [backend/scanner/web_assessment.py](../backend/scanner/web_assessment.py) **new**:
++  URL validation, direct IP transport, TLS/HTTP evidence and header observations.
++- [frontend/static/app.js](../frontend/static/app.js): truthful HTTPS failure
++  labels, categorized errors, saved headers/certificate/redirect evidence.
++- [tests/test_scan_execution.py](../tests/test_scan_execution.py): replace the old
++  Requests-specific expectation with a test of the retained public wrapper.
++- [tests/test_web_assessment.py](../tests/test_web_assessment.py) **new**: 19
++  mocked transport, policy, failure, worker, and read-only endpoint tests.
++- [tests/test_web_assessment.js](../tests/test_web_assessment.js) **new**: execute
++  the actual frontend reader with synthetic saved data, including escaped errors.
++- This document and [the exact Day 5 diff](../artifacts/day5-changes.patch) **new**.
++
++The existing network findings module, report generator, templates, requirements,
++and scan execution policy were not edited today. Earlier uncommitted changes
++remain in place. Do not reapply the patch to this already updated working tree.
++
++## Behavior and evidence now
++
++- HTTP/HTTPS only; literal IPv4/IPv6 addresses only, preserving the existing
++  no-DNS policy. Reject userinfo, fragments, zone IDs, backslashes, control
++  characters, malformed/zero ports, and unsupported addresses. Current operator
++  scope is checked during validation and immediately before connecting.
++- `RISKLENS_ALLOWED_TARGETS` remains mandatory. Default allowed web ports are
++  `80,443,8080,8443`; `RISKLENS_ALLOWED_WEB_PORTS` can replace that list with
++  explicit comma-separated numeric ports. The worker also checks the saved
++  authorized IP list, saved scope, and exact requested port before assessment.
++- A direct numeric-address socket prevents hostname rebinding. Verify its peer
++  matches the approved IP. Environment HTTP proxies are not used. TLS uses
++  `ssl.create_default_context()` with certificate and IP SAN verification on.
++  No insecure retry, secondary TLS probe, credential attempt, or exploit occurs.
++- Record HTTP status, requested URL as `final_url` (nothing is followed),
++  lowercase `http.headers`, and `http.raw_headers` preserving duplicate fields.
++  HTTP 4xx/5xx are recorded responses; transport completion does not mean the
++  application is healthy or secure.
++- Record `redirects` with raw Location, resolved destination, HTTP status,
++  `followed: false`, and a decision. Even approved redirects are not followed.
++  A scheme, IP, or port change is blocked, including HTTPS downgrade or another
++  approved IP. DNS names, credentials, malformed destinations, and disallowed
++  ports are blocked. `final_url` never pretends the redirect was visited.
++- TLS metadata comes from the same verified connection: negotiated protocol and
++  cipher, subject, issuer, validity dates, serial number, SANs, certificate DER
++  SHA-256, verification state, and provenance. Certificate failure has no claimed
++  negotiated protocol/certificate metadata and no invented HTTP observations.
++- Connect/handshake inactivity timeout: 5 seconds. Read inactivity timeout: 10
++  seconds. Body sampling: at most 200,000 bytes, with a 20-second assessment
++  budget checked between body reads. The remaining budget shortens body read
++  timeouts. `body_bytes_sampled` and `body_limit_reached` describe sampling.
++- Existing `url`, `http`, `tls`, `technologies`, `checks`, and optional string
++  `error` remain. Additive `status` is `completed`, `partial`, or `failed`;
++  `error_category` distinguishes certificate verification, TLS, connect timeout,
++  read timeout, refusal, connection/protocol errors, invalid URL, scope rejection,
++  configuration error, and blocked redirect. HTTP evidence survives body errors.
++  Empty/failed HTTP responses do not generate missing-header observations.
++- Header statuses are `missing`, `misconfigured`, `review`, or `not_applicable`.
++  Check empty values, XCTO `nosniff`, XFO `DENY`/`SAMEORIGIN`, HSTS positive
++  `max-age`, and recognized Referrer-Policy values. HSTS over HTTP is not
++  applicable. Nonempty CSP/Permissions-Policy need contextual review; their
++  presence is not a claim of adequate protection. Header observations have
++  informational severity; finding confidence concerns the observed header only.
++  Technology strings are hints tied to saved header/body evidence.
++- Atomic JSON publication prevents readers seeing partial files. A failed audit
++  is saved and stops Gobuster. Normal successful Web scans still run existing
++  Gobuster with its verified TLS/no-follow settings. GET returns saved successful
++  or failed JSON with 200; missing artifact is 404; unreadable/malformed is 500.
++  Opening results never repeats HTTP, TLS, DNS or credential operations.
++
++Example certificate failure (message and verification code depend on OpenSSL):
++
++```json
++{
++  "url": "https://127.0.0.1/",
++  "http": {},
++  "tls": {"verification": "failed", "error": "certificate verify failed", "verify_code": null},
++  "technologies": [],
++  "checks": [],
++  "status": "failed",
++  "redirects": [],
++  "error_category": "certificate_verification_failed",
++  "error": "certificate verify failed"
++}
++```
++
++## Windows PowerShell verification
++
++Use the existing configured environment (Python 3.14.3 here). If restoring a
++clean checkout, create that environment and install the dev requirements first:
++
++```powershell
++Set-Location 'D:\security project'
++# Only when the environment does not already exist:
++py -m venv .venv-baseline
++& '.\.venv-baseline\Scripts\python.exe' -m pip install -r .\requirements-dev.txt
++```
++
++Run tests; no Nmap, Gobuster, remote server, certificate installation or API keys
++are needed. Node is only needed for these standalone frontend tests:
++
++```powershell
++Set-Location 'D:\security project'
++& '.\.venv-baseline\Scripts\python.exe' -B -m unittest discover -s tests -v
++node .\tests\test_service_details.js
++node .\tests\test_web_assessment.js
++git diff --check
++```
++
++Actual result: `Ran 57 tests ... OK`; both Node checks print `PASS`. Coverage
++includes invalid certificate without retry, outside-scope/same-origin redirects,
++HTTPS downgrade, connect/read/body timeout, connection refusal, changed peer,
++revoked scope, denied ports, malformed configuration, bounded sampling, verified
++TLS evidence, failed artifact reads without probes, and no Gobuster after a
++failed assessment. Prior Nmap, no-credential, PDF/CSV and network finding tests
++also pass. The existing Starlette template deprecation warning is unrelated.
++
++Launch the app locally, setting only scope you own or are explicitly allowed to
++assess. The scope below authorizes loopback only:
++
++```powershell
++Set-Location 'D:\security project'
++$env:RISKLENS_ALLOWED_TARGETS = '127.0.0.1/32,::1/128'
++$env:RISKLENS_ALLOWED_WEB_PORTS = '80,443,8080,8443'
++& '.\.venv-baseline\Scripts\python.exe' -m uvicorn backend.main:app --host 127.0.0.1 --port 8787
++```
++
++In another terminal:
++
++```powershell
++Invoke-RestMethod 'http://127.0.0.1:8787/health'
++```
++
++Expected: `status: ok`, `service: risklens-backend`, and a boot ID.
++
++Optional local HTTP-only manual exercise, not performed during this change:
++start a deliberately owned fixture in a third terminal:
++
++```powershell
++Set-Location 'D:\security project'
++& '.\.venv-baseline\Scripts\python.exe' -m http.server 8080 --bind 127.0.0.1 --directory .\frontend\static
++```
++
++With app and fixture running, submit an explicitly authorized Web profile. This
++does run the existing Nmap and Gobuster binaries; they must be installed and
++configured as described on Day 3. No extra third-party target is involved:
++
++```powershell
++$body = @{target='http://127.0.0.1:8080'; ports='8080'; profile='web'; authorized=$true} | ConvertTo-Json
++$scan = Invoke-RestMethod -Method Post 'http://127.0.0.1:8787/scan' -ContentType 'application/json' -Body $body
++$deadline = (Get-Date).AddSeconds(450)
++do {
++    Start-Sleep -Seconds 1
++    $status = Invoke-RestMethod "http://127.0.0.1:8787/scan/$($scan.scan_id)"
++} while ($status.status -notin @('completed','failed') -and (Get-Date) -lt $deadline)
++$status | Format-List
++if ($status.gobuster_status -in @('completed','failed')) {
++    $assessment = Invoke-RestMethod "http://127.0.0.1:8787/webscan/$($scan.scan_id)/assessment"
++    $assessment | ConvertTo-Json -Depth 12
++}
++```
++
++Expected when the network step succeeds: saved HTTP status 200, lowercase
++headers, `tls.verification: not_applicable`, configuration observations, and
++`redirects: []`. Gobuster can fail independently (for example, wildcard-response
++behavior); inspect saved assessment and worker error separately. Nmap failure
++skips web entirely and creates no assessment artifact.
++
++## Limits and stop
++
++No real scan or live HTTP/TLS target request was executed for verification;
++transport and certificate behavior were tested with mocks. Hostnames remain
++unsupported; private HTTPS servers need a trusted certificate containing the
++literal IP in its SAN. Invalid certificates are reported, never bypassed.
++All redirects stop at the first response, even same-origin paths. One response
++and a bounded body sample do not establish whole-site policy or technology
++identity. TLS metadata covers the negotiated connection, not an exhaustive
++protocol/cipher audit. Inactivity timeouts and the between-read body budget are
++not a hard wall-clock deadline for slow header delivery. Old artifacts remain
++readable but cannot acquire missing evidence without an explicit new scan.
++Gobuster's independent requests retain their existing behavior and process
++deadline. No Exposure Change Detector or other day's scope was added. Stop here.

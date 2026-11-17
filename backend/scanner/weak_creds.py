@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import threading
 
-# ✅ Common usernames to pair with passwords
+#  Common usernames to pair with passwords
 COMMON_USERNAMES: List[str] = [
     "root", "admin", "user", "test", "guest", "administrator",
     "ubuntu", "pi", "oracle", "postgres", "mysql", "ftp", "www",
@@ -18,7 +18,7 @@ COMMON_USERNAMES: List[str] = [
 
 ROCKYOU_PATH = Path(__file__).resolve().parent.parent.parent / "wordlists" / "rockyou.txt"
 
-# ✅ Fallback if rockyou not found
+#  Fallback if rockyou not found
 FALLBACK_PASSWORDS: List[str] = [
     "123456", "password", "12345678", "qwerty", "123456789", "12345",
     "111111", "dragon", "123123", "letmein", "monkey", "master",
@@ -26,7 +26,7 @@ FALLBACK_PASSWORDS: List[str] = [
     "password1", "passw0rd", "1234", "1234567", "12345678", "000000",
 ]
 
-# ✅ Load top N passwords from rockyou.txt lazily
+# Load top N passwords from rockyou.txt lazily
 def load_rockyou(limit: int = 10000) -> List[str]:
     if not ROCKYOU_PATH.exists():
         return FALLBACK_PASSWORDS
@@ -43,7 +43,7 @@ def load_rockyou(limit: int = 10000) -> List[str]:
         return FALLBACK_PASSWORDS
     return passwords
 
-# ✅ Build credential pairs
+#  Build credential pairs
 def build_creds() -> List[Tuple[str, str]]:
     passwords = load_rockyou(limit=10000)
     creds = []
@@ -53,11 +53,11 @@ def build_creds() -> List[Tuple[str, str]]:
             creds.append((username, password))
     return creds
 
-# ✅ Load once at module level
+#  Load once at module level
 COMMON_CREDS: List[Tuple[str, str]] = build_creds()
 
 
-# ✅ Chunked parallel executor — stops immediately on first match
+#  Chunked parallel executor — stops immediately on first match
 def _parallel_check(
     check_fn,         # function(username, password) -> Dict | None
     creds: List[Tuple[str, str]],
@@ -101,8 +101,7 @@ def _parallel_check(
     return found_result if found_result else {"found": False}
 
 
-# ─── SSH ────────────────────────────────────────────────────────────────────
-
+# SSH
 def check_ssh_weak_creds(ip: str, port: int = 22, timeout: int = 3) -> Dict[str, Any]:
     def try_ssh(username: str, password: str) -> Dict | None:
         client = paramiko.SSHClient()
@@ -125,7 +124,7 @@ def check_ssh_weak_creds(ip: str, port: int = 22, timeout: int = 3) -> Dict[str,
     return _parallel_check(try_ssh, COMMON_CREDS, batch_size=200, max_workers=20, max_attempts=200)
 
 
-# ─── FTP ────────────────────────────────────────────────────────────────────
+# FTP
 
 def check_ftp_weak_creds(ip: str, port: int = 21, timeout: int = 3) -> Dict[str, Any]:
     def try_ftp(username: str, password: str) -> Dict | None:
@@ -143,7 +142,7 @@ def check_ftp_weak_creds(ip: str, port: int = 21, timeout: int = 3) -> Dict[str,
     return _parallel_check(try_ftp, COMMON_CREDS, batch_size=200, max_workers=20, max_attempts=200)
 
 
-# ─── HTTP Basic ─────────────────────────────────────────────────────────────
+# HTTP Basic
 
 def check_http_basic_weak_creds(
     base_url: str, timeout: int = 3, paths: List[str] | None = None
@@ -183,7 +182,7 @@ def check_http_basic_weak_creds(
     return {"found": False, "protocol": "http_basic"}
 
 
-# ─── Annotate ───────────────────────────────────────────────────────────────
+# Annotate parsed scan results with weak credential findings
 
 def annotate_services_with_weak_creds(parsed_scan: Dict[str, Any]) -> None:
     hosts = parsed_scan.get("hosts", [])

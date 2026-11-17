@@ -1,0 +1,1470 @@
+diff --git a/backend/main.py b/backend/main.py
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -10,7 +10,6 @@
+ import ipaddress
+ import json
+ import hashlib
+-from urllib.parse import urlparse
+ from pathlib import Path
+ from pydantic import BaseModel, Field
+ from backend.scanner.scan_policy import (
+@@ -18,6 +17,8 @@
+     normalize_ports, resolve_executable, nmap_command,
+ )
+ from backend.scanner.web_assessment import assess_web_url, validate_web_url
++from backend.scanner.web_rules import build_web_findings
++from backend.scanner.path_discovery import execute_discovery, prepare_wordlist, parse_paths, DiscoveryStopped
+ from backend.scanner.pcvp_scoring import pcvp_score_for_service
+ from backend.scanner.network_findings import normalized_observation, normalize_nvd_candidates, build_network_findings
+ from backend.scanner.attack_graph import build_attack_graph
+@@ -25,7 +26,6 @@
+ from backend.report_generator import build_pdf_report
+ from io import BytesIO
+ import io
+-import os
+ import threading
+ from datetime import datetime, timezone
+ 
+@@ -45,10 +45,11 @@
+ SCANS_DIR = BASE_DIR / "scans"
+ SCANS_DIR.mkdir(exist_ok=True)
+ SCAN_STATUS_FILE = SCANS_DIR / "scan_status.json"
+-GOBUSTER_WORDLIST = BASE_DIR.parent / "wordlists" / "common.txt"
++GOBUSTER_WORDLIST = BASE_DIR.parent / "wordlists" / "web-safe.txt"
+ 
+ STATUS_LOCK = threading.RLock()
+ SCAN_SLOTS = threading.BoundedSemaphore(1)
++DISCOVERY_STOPS: dict[str, threading.Event] = {}
+ 
+ BOOT_ID = str(uuid4())
+ 
+@@ -62,6 +63,7 @@
+     ports: Optional[str] = None
+     profile: str = "standard"
+     authorized: bool = False
++    path_discovery: bool = False
+ 
+ class ScanStatus(BaseModel):
+     scan_id: str
+@@ -81,6 +83,9 @@
+     authorized: bool = False
+     nmap_status: Optional[str] = None
+     nmap_exit_code: Optional[int] = None
++    path_discovery: bool = False
++    web_url: Optional[str] = None
++    web_status: Optional[str] = None
+ 
+ 
+ class WebScanRequest(BaseModel):
+@@ -200,7 +205,7 @@
+         temporary.replace(output)
+         record["xml"] = output.name
+         status.nmap_status = "completed"
+-        status.status = "completed" if status.gobuster_status == "skipped" else "nmap_done"
++        status.status = "nmap_done" if status.profile == "web" else "completed"
+         status.message = "Nmap scan completed." if status.status == "completed" else "Nmap completed; web assessment pending."
+         if status.status == "completed":
+             status.completed_at = _utc_now()
+@@ -332,8 +337,9 @@
+             _save_scan_status_store()
+         if status.nmap_status == "completed" and web_url:
+             run_gobuster_scan(scan_id, web_url)
+-            status.status = "failed" if status.gobuster_status == "failed" else "completed"
+-            status.message = "Network completed; web assessment failed." if status.status == "failed" else "Network and web assessments completed."
++            status.status = "failed" if status.web_status == "failed" else "completed"
++            status.message = ("Network completed; web assessment failed." if status.status == "failed" else
++                              f"Network and HTTP/TLS assessments completed; optional path discovery: {status.gobuster_status}.")
+             status.completed_at = _utc_now()
+             _save_scan_status_store()
+     except Exception as exc:
+@@ -344,6 +350,8 @@
+             status.completed_at = _utc_now()
+             _save_scan_status_store()
+     finally:
++        with STATUS_LOCK:
++            DISCOVERY_STOPS.pop(scan_id, None)
+         SCAN_SLOTS.release()
+ 
+ 
+@@ -355,12 +363,11 @@
+         raise HTTPException(status_code=400, detail="Exposure must be auto, internal, or external")
+     try:
+         plan = validate_request(request.target, request.ports, request.profile)
++        if request.path_discovery and request.profile != "web":
++            raise ValueError("Optional path discovery requires the Web profile")
+         resolve_executable("RISKLENS_NMAP_PATH", "nmap")
+         if plan["web_url"]:
+             validate_web_url(plan["web_url"], plan["scope"])
+-            resolve_executable("RISKLENS_GOBUSTER_PATH", "gobuster")
+-            if not GOBUSTER_WORDLIST.is_file():
+-                raise ConfigurationError("Gobuster wordlist is missing")
+     except ScopeError as exc:
+         raise HTTPException(status_code=403, detail=str(exc))
+     except ConfigurationError as exc:
+@@ -375,17 +382,22 @@
+         status = ScanStatus(
+             scan_id=scan_id, target=plan["target"], status="pending", message="Authorized scan scheduled.",
+             exposure=exposure, exposure_effective=(infer_exposure_from_target(plan["targets"][0]) if exposure == "auto" else exposure),
+-            gobuster_status="pending" if plan["web_url"] else "skipped", profile=request.profile,
++            gobuster_status="pending" if request.path_discovery else "skipped", profile=request.profile,
+             description=request.description, created_at=_utc_now(), ports=plan["ports"],
+             authorized_targets=plan["targets"], approved_scope=plan["scope"], nmap_status="pending",
+             authorized=True,
++            path_discovery=request.path_discovery, web_url=plan["web_url"],
++            web_status="pending" if plan["web_url"] else "skipped",
+         )
+         with STATUS_LOCK:
+             scan_status_store[scan_id] = status
++            if request.path_discovery:
++                DISCOVERY_STOPS[scan_id] = threading.Event()
+             _save_scan_status_store()
+         background_tasks.add_task(run_scan_job, scan_id, plan["web_url"])
+     except Exception:
+         scan_status_store.pop(scan_id, None)
++        DISCOVERY_STOPS.pop(scan_id, None)
+         SCAN_SLOTS.release()
+         raise HTTPException(status_code=500, detail="Cannot persist or schedule the scan")
+     return status
+@@ -592,21 +604,7 @@
+ 
+ def build_findings(parsed: dict, web_assessment: Optional[dict] = None) -> list[dict]:
+     findings = build_network_findings(parsed)
+-    for check in (web_assessment or {}).get("checks", []):
+-        if check.get("status") in {"missing", "misconfigured"}:
+-            findings.append({
+-                "id": f"WEB-{check.get('name', 'header').replace(' ', '-').upper()}",
+-                "title": f"Web configuration observation: {check.get('name')} ({check.get('status')})",
+-                "severity": "info",
+-                "confidence": "high",
+-                "asset": (web_assessment or {}).get("url", "web target"),
+-                "evidence": check.get("detail", ""),
+-                "remediation": f"Configure the {check.get('name')} response header.",
+-                "source": "HTTP assessment",
+-                "domain": "web", "category": "configuration_observation",
+-                "rule_id": "WEB-HEADER-001", "verification_status": "observed",
+-                "reason": "A saved HTTP response recorded a missing or misconfigured header; exploitation and application impact are not established.",
+-            })
++    findings.extend(build_web_findings(web_assessment))
+     rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+     return sorted(findings, key=lambda item: (rank.get(item["severity"], 0), float(item.get("cvss") or 0)), reverse=True)
+ 
+@@ -672,7 +670,7 @@
+     data = get_findings(scan_id)
+     output = io.StringIO()
+     writer = csv.DictWriter(output, fieldnames=["id", "title", "severity", "confidence", "asset", "source", "cvss", "evidence", "remediation",
+-                                              "domain", "category", "rule_id", "reason", "verification_status", "reported_cvss", "original_evidence"], extrasaction="ignore")
++                                              "domain", "category", "rule_id", "reason", "verification_status", "reported_cvss", "original_evidence", "retest"], extrasaction="ignore")
+     writer.writeheader()
+     for finding in data["findings"]:
+         row = dict(finding)
+@@ -712,192 +710,129 @@
+     graph = build_attack_graph(parsed)
+     return {"scan_id": scan_id, "exposure": scan_status.exposure, "graph": graph}
+ 
++def _validate_web_job(status: ScanStatus, url: str) -> None:
++    if not status.authorized or status.nmap_status != "completed":
++        raise ScopeError("Web assessment requires a completed authorized network scan")
++    parsed, host, port = validate_web_url(url, status.approved_scope)
++    if host not in status.authorized_targets:
++        raise ScopeError("Web target is outside saved scan targets")
++    validate_request(url, status.ports, "web")
++    if status.web_url:
++        approved, saved_host, saved_port = validate_web_url(status.web_url, status.approved_scope)
++        if (parsed.scheme, host, port) != (approved.scheme, saved_host, saved_port):
++            raise ScopeError("Web origin differs from the explicitly approved scheme, IP and port")
++    elif status.path_discovery:
++        raise ScopeError("Path discovery requires a saved explicitly approved web origin")
++    if parsed.path not in {"", "/"} or parsed.query:
++        raise ScopeError("Path discovery and assessment require the approved origin only")
++
++
+ def run_gobuster_scan(scan_id: str, url: str) -> None:
+-    output_path = SCANS_DIR / f"gobuster_{scan_id}.txt"
+-    status_path = SCANS_DIR / f"gobuster_{scan_id}.status"
+-    done_path = SCANS_DIR / f"gobuster_{scan_id}.done"
+-    SCANS_DIR.mkdir(parents=True, exist_ok=True)
+-
+-    #  Mark gobuster as running
++    """Keep the existing worker entry point: HTTP/TLS first, optional paths second."""
+     scan_st = scan_status_store.get(scan_id)
+-    if scan_st:
+-        scan_st.gobuster_status = "running"
+-        scan_status_store[scan_id] = scan_st
++    if scan_st is None:
++        return
++    output = SCANS_DIR / f"gobuster_{scan_id}.txt"
++    record_path = SCANS_DIR / f"gobuster_{scan_id}.status"
++    record = {"status": "skipped", "enabled": scan_st.path_discovery, "url": url,
++              "started_at": _utc_now(), "threads": 1, "delay": "1s", "timeout_seconds": 120}
++    with STATUS_LOCK:
++        stop = DISCOVERY_STOPS.setdefault(scan_id, threading.Event())
++    scan_st.web_status = "running"
++    try:
++        _validate_web_job(scan_st, url)
+         _save_scan_status_store()
+-
+-    gobuster_failed = False
+-    friendly_error: Optional[str] = None
+-
+-    try:
+-        host = urlparse(url).hostname
+-        if scan_st is None or not scan_st.authorized or scan_st.nmap_status != "completed":
+-            raise ScopeError("Web assessment requires a completed authorized network scan")
+-        validate_targets([host], scan_st.approved_scope)
+-        if host not in scan_st.authorized_targets:
+-            raise ScopeError("Web target is outside saved scan targets")
+-        validate_request(url, scan_st.ports, "web")
++        audit = run_web_security_assessment(url)
+         audit_path = SCANS_DIR / f"web_audit_{scan_id}.json"
+-        audit = run_web_security_assessment(url)
+-        temporary_audit = audit_path.with_suffix(".json.tmp")
+-        temporary_audit.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+-        temporary_audit.replace(audit_path)
++        temporary = audit_path.with_suffix(".json.tmp")
++        temporary.write_text(json.dumps(audit, indent=2), encoding="utf-8")
++        temporary.replace(audit_path)
+         if audit.get("error"):
+             raise RuntimeError(f"{audit.get('error_category', 'assessment_error')}: {audit['error']}")
+-
+-        urls = [url]
+-
+-        last_error = ""
+-        for candidate_url in urls:
+-            cmd = [
+-                resolve_executable("RISKLENS_GOBUSTER_PATH", "gobuster"),
+-                "dir",
+-                "-u", candidate_url,
+-                "-w", str(GOBUSTER_WORDLIST),
+-                "-o", str(output_path),
+-                "-t", "2",
+-                "--timeout", "10s",
+-                "--no-color",
+-                "-q",
+-            ]
+-            result = subprocess.run(
+-                cmd,
+-                capture_output=True,
+-                text=True,
+-                timeout=120,
+-                shell=False,
+-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+-                env={key: value for key, value in os.environ.items()
+-                     if key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}},
+-            )
+-            if result.returncode == 0:
+-                last_error = ""
+-                break
+-            last_error = f"Gobuster exited with code {result.returncode}: " + (result.stderr or result.stdout or "No diagnostic output").strip()
+-
+-        if last_error:
+-            gobuster_failed = True
+-            raw_err = last_error or "Gobuster exited with an error"
+-            friendly_error = _normalize_webscan_error(raw_err)
+-            with status_path.open("w", encoding="utf-8") as f:
+-                json.dump({
+-                    "summary": friendly_error,
+-                    "detail": raw_err[:2000],
+-                }, f, indent=2)
+-
+-    except subprocess.TimeoutExpired:
+-        gobuster_failed = True
+-        friendly_error = "Web scan timed out (overall gobuster timeout)."
+-        with status_path.open("w", encoding="utf-8") as f:
+-            json.dump({"summary": friendly_error}, f, indent=2)
+-
+-    except Exception as e:
+-        gobuster_failed = True
+-        friendly_error = _normalize_webscan_error(str(e))
+-        with status_path.open("w", encoding="utf-8") as f:
+-            json.dump({"summary": friendly_error, "detail": str(e)[:2000]}, f, indent=2)
+-
++        scan_st.web_status = "completed"
++        if not scan_st.path_discovery:
++            record["summary"] = "Optional path discovery was not requested."
++            return
++        if stop.is_set():
++            raise DiscoveryStopped("Path discovery stopped before launch")
++        executable = resolve_executable("RISKLENS_GOBUSTER_PATH", "gobuster")
++        words = SCANS_DIR / f"gobuster_{scan_id}.words.txt"
++        record["word_count"] = prepare_wordlist(GOBUSTER_WORDLIST, words)
++        scan_st.gobuster_status = "running"
++        _save_scan_status_store()
++        record["command"] = execute_discovery(executable, url, words, output, stop,
++                                               lambda: _validate_web_job(scan_st, url))
++        record["status"] = "completed"
++        record["summary"] = "Optional path discovery completed; path responses are observations only."
++    except Exception as exc:
++        if scan_st.web_status == "running":
++            scan_st.web_status = "failed"
++        category = ("cancelled" if isinstance(exc, DiscoveryStopped) else
++                    "timed_out" if isinstance(exc, subprocess.TimeoutExpired) else "failed")
++        record.update(status=category, summary=str(exc)[:2000], detail=str(exc)[:2000],
++                      error_category=("scope_rejected" if isinstance(exc, ScopeError) else
++                                      "configuration_error" if isinstance(exc, ConfigurationError) else category))
+     finally:
+-        # ✅ Always write .done so UI can stop waiting
+-        try:
+-            with done_path.open("w", encoding="utf-8") as f:
+-                f.write("done")
+-        except Exception as e:
+-            print(f"[GOBUSTER] Failed to write .done file: {e}")
+-
+-        # Mark gobuster status accurately
+-        scan_st = scan_status_store.get(scan_id)
+-        if scan_st:
+-            scan_st.gobuster_status = "failed" if gobuster_failed else "completed"
+-            scan_status_store[scan_id] = scan_st
+-            _save_scan_status_store()
+-# Now checks .done file instead of .txt file
++        record["completed_at"] = _utc_now()
++        scan_st.gobuster_status = record["status"]
++        temporary = record_path.with_suffix(".status.tmp")
++        temporary.write_text(json.dumps(record, indent=2), encoding="utf-8")
++        temporary.replace(record_path)
++        (SCANS_DIR / f"gobuster_{scan_id}.done").write_text("done", encoding="utf-8")
++        _save_scan_status_store()
++        with STATUS_LOCK:
++            DISCOVERY_STOPS.pop(scan_id, None)
++
++
++@app.post("/webscan/{scan_id}/stop")
++def stop_path_discovery(scan_id: str):
++    with STATUS_LOCK:
++        status = scan_status_store.get(scan_id)
++        if status is None:
++            raise HTTPException(status_code=404, detail="Scan not found")
++        event = DISCOVERY_STOPS.get(scan_id)
++        if not status.path_discovery or event is None or status.gobuster_status not in {"pending", "running"}:
++            raise HTTPException(status_code=409, detail="No optional path job is pending or running")
++        event.set()
++    return {"scan_id": scan_id, "status": "stop_requested"}
++
++
+ @app.get("/webscan/{scan_id}", response_model=WebScanStatus)
+ def get_web_scan_status(scan_id: str):
+-    done_path = SCANS_DIR / f"gobuster_{scan_id}.done"
+-    status_path = SCANS_DIR / f"gobuster_{scan_id}.status"
+-
+-    if done_path.exists():
+-        if status_path.exists():
+-            try:
+-                status_data = json.loads(status_path.read_text(encoding="utf-8"))
+-            except json.JSONDecodeError:
+-                status_data = {"summary": status_path.read_text(encoding="utf-8", errors="ignore").strip()}
+-            output_path = SCANS_DIR / f"gobuster_{scan_id}.txt"
+-            has_results = output_path.exists() and output_path.stat().st_size > 0
+-            return WebScanStatus(
+-                scan_id=scan_id,
+-                status="completed_with_warnings" if has_results else "failed",
+-                message=status_data.get("summary") or "Web scan completed with a warning.",
+-            )
+-        return WebScanStatus(scan_id=scan_id, status="completed", message="Gobuster scan completed.")
+-    else:
+-        return WebScanStatus(scan_id=scan_id, status="running", message="Gobuster scan is still running or not started.")
++    status = scan_status_store.get(scan_id)
++    if status is None:
++        raise HTTPException(status_code=404, detail="Scan not found")
++    return WebScanStatus(scan_id=scan_id, status=status.gobuster_status or "skipped",
++                         message=f"Optional path discovery: {status.gobuster_status}; HTTP/TLS: {status.web_status or 'not recorded'}.")
++
+ 
+ def parse_gobuster_output(path: Path) -> List[dict]:
+-    entries: List[dict] = []
+-    if not path.exists():
+-        return entries
+-
+-    with path.open("r", encoding="utf-8", errors="ignore") as f:
+-        for line in f:
+-            line = line.strip()
+-            if not line or line.startswith("#"):
+-                continue
+-
+-            try:
+-                part, rest = line.split(" (Status:", 1)
+-                web_path = part.strip()
+-                rest = rest.strip()
+-                status_part, size_part = rest.split(")", 1)
+-                status = int(status_part.strip())
+-                size = None
+-                if "[Size:" in size_part:
+-                    size_str = size_part.split("[Size:", 1)[1].split("]")[0].strip()
+-                    if size_str.isdigit():
+-                        size = int(size_str)
+-            except ValueError:
+-                continue
+-
+-            entries.append({
+-                "path": web_path,
+-                "status": status,
+-                "size": size,
+-            })
+-
+-    return entries
++    return parse_paths(path)
++
+ 
+ @app.get("/webscan/{scan_id}/results")
+ def get_web_scan_results(scan_id: str):
+-    output_path = SCANS_DIR / f"gobuster_{scan_id}.txt"
+-    status_path = SCANS_DIR / f"gobuster_{scan_id}.status"
+-
+-    error_message = None
+-    error_detail = None
+-    if status_path.exists():
++    output = SCANS_DIR / f"gobuster_{scan_id}.txt"
++    record_path = SCANS_DIR / f"gobuster_{scan_id}.status"
++    status = scan_status_store.get(scan_id)
++    if status is None and not output.exists() and not record_path.exists():
++        raise HTTPException(status_code=404, detail="Scan not found")
++    record = {}
++    if record_path.exists():
++        raw_record = record_path.read_text(encoding="utf-8")
+         try:
+-            status_data = json.loads(status_path.read_text(encoding="utf-8"))
+-            error_message = status_data.get("summary")
+-            error_detail = status_data.get("detail")
++            record = json.loads(raw_record)
+         except json.JSONDecodeError:
+-            error_message = status_path.read_text(encoding="utf-8", errors="ignore").strip()
+-
+-    if not output_path.exists():
+-        if error_message:
+-            return {
+-                "scan_id": scan_id,
+-                "results": [],
+-                "error": error_message,
+-                "error_detail": error_detail,
+-            }
+-        raise HTTPException(status_code=404, detail="Gobuster output not found yet")
+-
+-    entries = parse_gobuster_output(output_path)
+-    return {
+-        "scan_id": scan_id,
+-        "results": entries,
+-        "error": error_message,
+-        "error_detail": error_detail,
+-    }
++            record = {"summary": raw_record.strip()}
++    discovery_status = record.get("status", status.gobuster_status if status else "legacy")
++    error = record.get("summary") if discovery_status in {"failed", "timed_out", "cancelled", "legacy"} else None
++    # Legacy .status files contain only summary/detail and remain readable.
++    if record and "status" not in record:
++        error = record.get("summary")
++    return {"scan_id": scan_id, "results": parse_gobuster_output(output),
++            "error": error, "error_detail": record.get("detail"), "discovery_status": discovery_status,
++            "enabled": record.get("enabled", status.path_discovery if status else None),
++            "partial": discovery_status in {"failed", "timed_out", "cancelled"}}
+ 
+ 
+ @app.get("/webscan/{scan_id}/assessment")
+@@ -909,6 +844,11 @@
+         return json.loads(assessment_path.read_text(encoding="utf-8"))
+     except (OSError, json.JSONDecodeError) as exc:
+         raise HTTPException(status_code=500, detail=f"Failed to read web assessment: {exc}")
++
++
++@app.get("/webscan/{scan_id}/findings")
++def get_web_findings(scan_id: str):
++    return {"scan_id": scan_id, "findings": build_web_findings(get_web_security_assessment(scan_id))}
+ 
+ 
+ @app.get("/scan/{scan_id}/alive-hosts")
+@@ -969,7 +909,9 @@
+     annotate_saved_services(parsed, exposure_effective)
+ 
+     attack_graph = build_attack_graph(parsed)
+-    findings = build_findings(parsed)
++    audit_path = SCANS_DIR / f"web_audit_{scan_id}.json"
++    audit = json.loads(audit_path.read_text(encoding="utf-8")) if audit_path.exists() else None
++    findings = build_findings(parsed, audit)
+ 
+     pdf_bytes = build_pdf_report(
+         scan_id=scan_id,
+diff --git a/backend/scanner/path_discovery.py b/backend/scanner/path_discovery.py
+new file mode 100644
+--- /dev/null
++++ b/backend/scanner/path_discovery.py
+@@ -0,0 +1,87 @@
++"""Bounded optional Gobuster process. All output remains path observations."""
++
++import os
++from pathlib import Path
++import re
++import subprocess
++from time import monotonic
++
++from backend.scanner.scan_policy import ConfigurationError
++
++JOB_TIMEOUT = 120
++MAX_WORDS = 32
++
++
++class DiscoveryStopped(RuntimeError):
++    pass
++
++
++def prepare_wordlist(source: Path, destination: Path):
++    if not source.is_file() or source.stat().st_size > 8192:
++        raise ConfigurationError("The bounded web discovery wordlist is missing or too large")
++    words = list(dict.fromkeys(line.strip() for line in source.read_text(encoding="utf-8").splitlines()
++                              if line.strip() and not line.lstrip().startswith("#")))
++    if not 1 <= len(words) <= MAX_WORDS:
++        raise ConfigurationError(f"Optional discovery requires 1-{MAX_WORDS} paths")
++    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}", word)
++           or any(part in {"", ".", ".."} for part in word.split("/")) for word in words):
++        raise ConfigurationError("Discovery wordlist contains unsafe paths")
++    destination.write_text("\n".join(words) + "\n", encoding="utf-8")
++    return len(words)
++
++
++def execute_discovery(executable, url, wordlist, output, stop_event, validate_scope):
++    command = [executable, "dir", "-u", url, "-w", str(wordlist), "-o", str(output),
++               "-t", "1", "--delay", "1s", "--timeout", "5s", "--no-color", "--no-progress", "-q"]
++    # No -k, redirect-following, extensions, recursion, retries or extra targets.
++    process = None
++    started = monotonic()
++    try:
++        validate_scope()
++        if stop_event.is_set():
++            raise DiscoveryStopped("Path discovery stopped before launch")
++        with output.with_suffix(".stdout.log").open("wb") as stdout, output.with_suffix(".stderr.log").open("wb") as stderr:
++            process = subprocess.Popen(
++                command, shell=False, stdout=stdout, stderr=stderr,
++                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
++                env={key: value for key, value in os.environ.items()
++                     if key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}})
++            while process.poll() is None:
++                if stop_event.is_set():
++                    raise DiscoveryStopped("Path discovery stopped by the operator")
++                if monotonic() - started >= JOB_TIMEOUT:
++                    raise subprocess.TimeoutExpired(command, JOB_TIMEOUT)
++                validate_scope()
++                stop_event.wait(0.2)
++            code = process.wait(timeout=5)
++        if code:
++            with output.with_suffix(".stderr.log").open("rb") as diagnostic:
++                diagnostic.seek(max(0, output.with_suffix(".stderr.log").stat().st_size - 2000))
++                detail = diagnostic.read(2000).decode("utf-8", errors="replace")
++            raise RuntimeError(f"Gobuster exited with code {code}: {detail or 'No diagnostic output'}")
++        return command
++    finally:
++        # Popen has no shell/child launcher; kill and reap the actual job on every early exit.
++        if process is not None and process.poll() is None:
++            process.kill()
++            process.wait(timeout=5)
++
++
++def parse_paths(path):
++    entries, seen = [], set()
++    if not path.exists():
++        return entries
++    with path.open(encoding="utf-8", errors="replace") as stream:
++        for line in stream:
++            match = re.fullmatch(r"(/\S*)\s+\(Status:\s*(\d{3})\)\s*(?:\[Size:\s*(\d+)\])?.*", line.strip())
++            if not match:
++                continue
++            web_path, status, size = match.groups()
++            status = int(status)
++            if web_path.startswith("//") or not 100 <= status <= 599 or (web_path, status) in seen:
++                continue
++            seen.add((web_path, status))
++            entries.append({"path": web_path, "status": status, "size": int(size) if size else None,
++                            "category": "path_observation", "evidence": line.strip(),
++                            "interpretation": "A path response was observed; access, sensitivity and vulnerability are not established."})
++    return entries
+diff --git a/backend/scanner/web_rules.py b/backend/scanner/web_rules.py
+new file mode 100644
+--- /dev/null
++++ b/backend/scanner/web_rules.py
+@@ -0,0 +1,44 @@
++"""Deterministic web observations derived only from saved HTTP/TLS evidence."""
++
++HEADER_RULES = {
++    "HSTS": ("WEB-HDR-001", "On verified HTTPS, configure Strict-Transport-Security with a positive max-age after checking subdomain readiness."),
++    "Content-Security-Policy": ("WEB-HDR-002", "Review a Content-Security-Policy for this application; test a restrictive policy in report-only mode before enforcing it."),
++    "X-Content-Type-Options": ("WEB-HDR-003", "Return X-Content-Type-Options: nosniff and correct Content-Type values."),
++    "X-Frame-Options": ("WEB-HDR-004", "Review framing requirements; use CSP frame-ancestors and, where appropriate, X-Frame-Options: DENY or SAMEORIGIN."),
++    "Referrer-Policy": ("WEB-HDR-005", "Choose a supported Referrer-Policy, for example strict-origin-when-cross-origin, based on application requirements."),
++    "Permissions-Policy": ("WEB-HDR-006", "Review browser features in use and set a Permissions-Policy restricting unneeded features."),
++}
++
++
++def build_web_findings(assessment):
++    assessment = assessment or {}
++    findings = []
++    for check in assessment.get("checks", []):
++        if check.get("status") not in {"missing", "misconfigured"} or check.get("name") not in HEADER_RULES:
++            continue
++        rule, remediation = HEADER_RULES[check["name"]]
++        findings.append({
++            "id": rule, "rule_id": rule,
++            "title": f"Web configuration observation: {check['name']} ({check['status']})",
++            "severity": "info", "confidence": "high", "confidence_scope": "saved response header only",
++            "asset": assessment.get("url", "web target"), "source": "HTTP assessment",
++            "domain": "web", "category": "configuration_observation", "verification_status": "observed",
++            "evidence": check.get("detail", ""),
++            "original_evidence": {"http": assessment.get("http", {}), "check": check},
++            "reason": "Saved response configuration; application impact and exploitation are not established.",
++            "remediation": remediation,
++            "retest": f"Explicitly run another Web assessment of the same approved URL; inspect {check['name']} in the saved response headers and review its value. Opening saved results does not re-test.",
++        })
++    if assessment.get("error_category") == "certificate_verification_failed":
++        findings.append({
++            "id": "WEB-TLS-001", "rule_id": "WEB-TLS-001", "title": "TLS certificate verification failed",
++            "severity": "low", "confidence": "high", "confidence_scope": "local trust and IP identity verification",
++            "asset": assessment.get("url", "web target"), "source": "Verified TLS handshake",
++            "domain": "web", "category": "configuration_observation", "verification_status": "observed",
++            "evidence": assessment.get("error", "Certificate verification failed"),
++            "original_evidence": assessment.get("tls", {}),
++            "reason": "The local client could not verify the certificate; this does not establish interception or exploitation.",
++            "remediation": "Review the reported validation error, certificate dates, chain, trusted issuer and IP SAN. Install a valid matching certificate or deliberately trust the local issuing CA; keep verification enabled.",
++            "retest": "Explicitly run another Web assessment of the same approved HTTPS URL. Expect tls.verification=verified and HTTP evidence; do not bypass verification. Opening saved results does not re-test.",
++        })
++    return findings
+diff --git a/docs/DAY-06.md b/docs/DAY-06.md
+new file mode 100644
+--- /dev/null
++++ b/docs/DAY-06.md
+@@ -0,0 +1,261 @@
++# Day 6 — optional path observations and independent web rules
++
++## What the real code did before this change
++
++Inspected `run_gobuster_scan()`, its callers and result readers, the bundled
++wordlist, the frontend request/render code, and existing regression tests.
++The bundled Gobuster executable reports version 3.8.2 in its local
++`dir --help`; that help confirms the flags used below, verified TLS by default,
++and redirect following disabled by default. Only help was executed, not a scan.
++
++Previously every authorized Web profile ran HTTP/TLS assessment followed by
++Gobuster. Submission required Gobuster even when only HTTP evidence was wanted.
++The command used safe subprocess arguments with two workers, 10-second HTTP
++timeout and 120-second process timeout, but no request delay or operator stop.
++`wordlists/common.txt` contains 4,751 lines, including `.env`, `.git/config`,
++and shell history paths. Its size exceeds a small local assessment's needs.
++The path parser produced `{path, status, size}`. The frontend inserted these
++values into HTML without escaping and described completion as Nmap + Gobuster.
++Web header findings shared one generic rule ID and lacked re-test instructions;
++certificate errors did not generate a separate actionable rule.
++
++Implemented plan: preserve the worker and old JSON fields, make discovery a
++separate opt-in within the Web job, bound the wordlist/process/rate, retain saved
++path evidence, and expose deterministic web rules independently of path results.
++Normal Nmap scans, stored artifacts and HTTP/TLS assessment remain usable.
++
++## Files modified and new files
++
++- [backend/main.py](../backend/main.py): default-false `path_discovery` request
++  and persisted flag, saved exact `web_url`, independent `web_status`, worker
++  validation and optional execution, stop endpoint, path status/observations,
++  saved-data web findings endpoint, CSV re-test column, web findings in PDF input.
++- [backend/scanner/path_discovery.py](../backend/scanner/path_discovery.py)
++  **new**: bounded wordlist snapshot, safe Gobuster process lifecycle and parser.
++- [backend/scanner/web_rules.py](../backend/scanner/web_rules.py) **new**:
++  deterministic rules using saved checks/certificate errors only.
++- [wordlists/web-safe.txt](../wordlists/web-safe.txt) **new**: 15 common paths.
++  The original [common.txt](../wordlists/common.txt) is preserved and unused by
++  the optional job. No automatic full-list fallback occurs.
++- [frontend/templates/index.html](../frontend/templates/index.html): unchecked
++  optional checkbox, independent web findings panel, path-job state and stop.
++- [frontend/static/app.js](../frontend/static/app.js): explicit request flag,
++  truthful job messages, saved web rule rendering with remediation/re-test,
++  escaped path values, incomplete coverage and skipped states. Invalidate the
++  old cached path HTML once. Restoring history does not opt into a future job.
++- [tests/test_path_discovery.py](../tests/test_path_discovery.py) **new**: 18
++  process, policy, job, saved-data and rule regressions.
++- [tests/test_path_discovery.js](../tests/test_path_discovery.js) **new**:
++  actual frontend path renderer, HTML escaping, opt-in markup and job states.
++- [tests/test_web_assessment.js](../tests/test_web_assessment.js): assert the
++  additional saved-rule request, rule evidence, remediation and re-test display.
++- [tests/test_read_only_endpoints.py](../tests/test_read_only_endpoints.py) and
++  [tests/test_scan_execution.py](../tests/test_scan_execution.py): explicitly
++  opt into existing path-job tests and mock the new process boundary.
++- This document and [the exact Day 6 patch](../artifacts/day6-changes.patch).
++
++No dependencies, AI features, credential checks, external analytics, or intrusive
++NSE scripts were added. The Day 5 transport/header checker was reused unchanged.
++
++## Execution, scope, output and stopping
++
++`POST /scan` still requires `authorized: true` plus operator-configured IP scope.
++The Web profile performs its existing Nmap and verified HTTP/TLS assessment.
++`path_discovery` defaults to **false**, including old persisted scans without
++this field. Only Web requests can opt in. Missing Gobuster never prevents a
++default HTTP/TLS-only job. For opted-in jobs, binary or discovery failure is
++recorded separately after HTTP/TLS evidence is saved.
++
++Optional command, expressed as arguments rather than a shell command string:
++
++```text
++<resolved gobuster.exe> dir -u <saved exact origin>
++  -w <saved 15-path snapshot> -o <saved output>
++  -t 1 --delay 1s --timeout 5s --no-color --no-progress -q
++```
++
++One worker waits one second between wordlist requests. Gobuster also performs
++its own startup/wildcard prechecks; the delay is not a global transport-level
++rate limiter for those probes. Only one application scan job can run at a time.
++Wordlist validation allows at most 32 short relative entries and an 8 KiB file;
++schemes, query strings, empty segments and traversal are rejected. The shipped
++15-path list avoids sensitive-file enumeration. No extensions, recursion,
++credentials, retries, force, redirect following, or TLS bypass flags are used.
++Environment proxy settings are removed from the child process.
++
++Before assessment and child launch, validate current and saved scope, saved
++authorization, completed network step, exact IP, requested port and saved
++scheme/IP/port origin. DNS names are still unsupported, avoiding DNS rebinding.
++Revalidate scope about every 200 ms while the child runs. This polling is a
++bounded detection delay, not packet-level enforcement against simultaneous
++configuration edits; the command itself always contains the approved numeric
++origin and never follows redirects.
++
++The child has a 120-second job deadline, polled every 200 ms, and a five-second
++HTTP request timeout. Stop, deadline, scope revocation or an early exit kills
++the actual child if still running and waits up to five seconds to reap it.
++No shell process, background detached scanner, insecure retry or auto-resume.
++The Stop button calls `POST /webscan/{scan_id}/stop`; it can also cancel a
++pending optional job before launch. It stops discovery only, not Nmap or the
++initial HTTP/TLS assessment. The HTTP response acknowledges `stop_requested`;
++the worker records `cancelled` after stopping. No active job returns 409;
++unknown scan returns 404.
++
++Saved files keep their existing names: `web_audit_<id>.json`,
++`gobuster_<id>.txt`, `.status`, and `.done`. Added `.words.txt`, `.stdout.log`,
++and `.stderr.log` preserve the exact bounded input and process diagnostics.
++The status JSON includes enabled flag, exact URL, rate settings, timestamps,
++word count when available, command on successful completion, error details and
++terminal state. Status publication is atomic. Failed/stopped jobs retain any
++partial path output and clearly mark incomplete coverage.
++
++`GET /webscan/{id}/results` preserves `scan_id`, `results`, `error`,
++`error_detail`, and adds `enabled`, `discovery_status`, `partial`. States include
++`pending`, `running`, `skipped`, `completed`, `failed`, `timed_out`, `cancelled`.
++Each path preserves `path`, numeric `status`, optional `size`, adding original
++line `evidence`, `category: path_observation`, and a conservative interpretation.
++Redirect destinations in output are text evidence, never followed or linked.
++Empty completed output means no observed paths under this limited coverage;
++missing/failed/cancelled output is not presented as successful negative coverage.
++404 is excluded by Gobuster's default status filter. Paths never generate
++vulnerability findings, regardless of status code or name.
++
++`GET /webscan/{id}/assessment` retains the Day 5 artifact contract.
++New `GET /webscan/{id}/findings` returns `{scan_id, findings}` from that saved
++artifact alone, even without Nmap XML or successful Gobuster. The Web panel
++always displays those rules independently. Existing combined findings/CSV/PDF
++also receive web findings when a saved assessment is available. Overall scan
++completion reflects network/HTTP assessment; optional discovery failure appears
++in `gobuster_status` and the completion message rather than hiding web findings.
++All GET endpoints remain read-only and never start a scanner, TLS connection,
++DNS lookup, password attempt, or automatic re-test.
++
++## Rules
++
++Every emitted rule carries `id`, `rule_id`, title, evidence, original evidence,
++severity, confidence scope, domain, verification status, remediation, and
++explicit `retest` instructions. No claim of exploitation is made.
++
++| ID | Saved evidence trigger | Severity | Action and explicit re-test |
++|---|---|---|---|
++| WEB-HDR-001 | HTTPS HSTS missing, empty, invalid max-age or max-age=0 | info | Review positive max-age and subdomain readiness; repeat authorized Web assessment and inspect HSTS. HTTP is not applicable. |
++| WEB-HDR-002 | CSP missing or empty | info | Design/test an application-appropriate CSP, initially report-only; repeat assessment and review the header. |
++| WEB-HDR-003 | XCTO absent or not nosniff | info | Set nosniff and correct Content-Type; repeat and inspect the exact value. |
++| WEB-HDR-004 | XFO absent or not DENY/SAMEORIGIN | info | Review framing needs/CSP frame-ancestors and legacy XFO; repeat and inspect headers. CSP may already provide adequate framing policy. |
++| WEB-HDR-005 | Referrer-Policy absent or no recognized value | info | Select a supported application-appropriate policy; repeat and review the value. |
++| WEB-HDR-006 | Permissions-Policy absent or empty | info | Restrict unneeded browser features after reviewing application needs; repeat and inspect policy. |
++| WEB-TLS-001 | certificate_verification_failed from verified transport | low | Review dates, trust chain/issuer and matching IP SAN; repeat with verification enabled and expect verified TLS/HTTP evidence. |
++
++Nonempty CSP/Permissions-Policy need review rather than automatic approval.
++No HTTP response produces no missing-header rules. A TLS verification failure
++does not establish interception; a private CA may simply be untrusted locally.
++Opening saved results never performs the re-test.
++
++## PowerShell run and tests
++
++Use the existing environment. If reconstructing a clean checkout, create it and
++install development requirements first:
++
++```powershell
++Set-Location 'D:\security project'
++# Only if the environment does not already exist:
++py -m venv .venv-baseline
++& '.\.venv-baseline\Scripts\python.exe' -m pip install -r .\requirements-dev.txt
++```
++
++Mocked tests need neither an installed Gobuster nor a reachable target:
++
++```powershell
++Set-Location 'D:\security project'
++& '.\.venv-baseline\Scripts\python.exe' -B -m unittest discover -s tests -v
++node .\tests\test_service_details.js
++node .\tests\test_web_assessment.js
++node .\tests\test_path_discovery.js
++git diff --check
++```
++
++Expected: 75 Python tests, `OK`, and three frontend `PASS` lines. Tests cover
++successful/empty discovery, missing executable, timeout kill/reap, operator stop,
++scope revocation and changed origin, unsafe wordlist, exact rate/arguments,
++partial failures, conservative rules, no automatic discovery on default Web,
++independent findings, escaped path output, and all earlier regression cases.
++The pre-existing Starlette template deprecation warning may appear.
++
++Launch locally; the example approves only loopback:
++
++```powershell
++Set-Location 'D:\security project'
++$env:RISKLENS_ALLOWED_TARGETS = '127.0.0.1/32,::1/128'
++$env:RISKLENS_ALLOWED_WEB_PORTS = '80,443,8080,8443'
++# For live jobs, Nmap must be on PATH or set RISKLENS_NMAP_PATH to its installed executable.
++# Optional discovery can use the bundled executable, or Gobuster on PATH:
++$env:RISKLENS_GOBUSTER_PATH = (Resolve-Path '.\gobuster_Windows_x86_64\gobuster.exe').Path
++& '.\.venv-baseline\Scripts\python.exe' -m uvicorn backend.main:app --host 127.0.0.1 --port 8787
++```
++
++In another terminal, check health and optionally run an owned local fixture:
++
++```powershell
++Invoke-RestMethod 'http://127.0.0.1:8787/health'
++# Separate terminal; keep it running only for the optional local exercise:
++Set-Location 'D:\security project'
++& '.\.venv-baseline\Scripts\python.exe' -m http.server 8080 --bind 127.0.0.1 --directory .\frontend\static
++```
++
++Submit and inspect HTTP/TLS only (no Gobuster needed). This manual exercise
++still runs the existing Nmap step and requires installed/configured Nmap:
++
++```powershell
++$body = @{target='http://127.0.0.1:8080'; profile='web'; ports='8080'; authorized=$true; path_discovery=$false} | ConvertTo-Json
++$scan = Invoke-RestMethod -Method Post 'http://127.0.0.1:8787/scan' -ContentType 'application/json' -Body $body
++$deadline = (Get-Date).AddSeconds(450)
++do {
++    Start-Sleep -Seconds 1
++    $state = Invoke-RestMethod "http://127.0.0.1:8787/scan/$($scan.scan_id)"
++} while ($state.status -notin @('completed','failed') -and (Get-Date) -lt $deadline)
++$state | Format-List
++Invoke-RestMethod "http://127.0.0.1:8787/webscan/$($scan.scan_id)/assessment" | ConvertTo-Json -Depth 12
++Invoke-RestMethod "http://127.0.0.1:8787/webscan/$($scan.scan_id)/findings" | ConvertTo-Json -Depth 12
++Invoke-RestMethod "http://127.0.0.1:8787/webscan/$($scan.scan_id)/results" | ConvertTo-Json -Depth 6
++```
++
++Expected if Nmap/fixture succeed: overall `completed`, `web_status: completed`,
++`gobuster_status: skipped`, saved HTTP status 200, configuration observations,
++and empty path results. Health returns `status: ok`. A failed network step skips
++web entirely; do not interpret absent assessment as empty findings.
++
++To explicitly opt into a new local path job, change only the boolean and submit
++again. This intentionally makes requests to the owned fixture:
++
++```powershell
++$body = @{target='http://127.0.0.1:8080'; profile='web'; ports='8080'; authorized=$true; path_discovery=$true} | ConvertTo-Json
++$scan = Invoke-RestMethod -Method Post 'http://127.0.0.1:8787/scan' -ContentType 'application/json' -Body $body
++# Optional while that path job is pending or running:
++Invoke-RestMethod -Method Post "http://127.0.0.1:8787/webscan/$($scan.scan_id)/stop"
++# Poll /scan/{id} as above, then inspect the saved path state:
++Invoke-RestMethod "http://127.0.0.1:8787/webscan/$($scan.scan_id)/results" | ConvertTo-Json -Depth 6
++```
++
++Expected stop acknowledgement: `stop_requested`, then terminal discovery
++`cancelled` if it had not already finished. Without stopping, this particular
++static fixture may produce no listed paths; that is a successful empty
++observation set, not proof of security. Missing Gobuster gives discovery
++`failed` and an explicit error while completed HTTP findings stay available.
++Timeout gives `timed_out` with incomplete coverage. Outside-scope submission
++returns 403 before any job/probe; changed worker origin fails before HTTP or
++child launch. Test those failure modes with the mocked suite rather than an
++unauthorized live target.
++
++## Limits and stop
++
++Verification used mocked HTTP/process responses and the executable's local
++help; no live Nmap/Gobuster assessment or target HTTP request was performed.
++Gobuster's startup prechecks are additional requests. A one-second per-worker
++delay is not a precise aggregate RPS budget. The 15-path list is deliberately
++incomplete, wildcard responses can prevent discovery, and different Gobuster
++versions may reject flags or use an unsupported output format (failures are
++reported; no unsafe fallback). Scope changes are observed by polling; they do
++not retract requests already in flight. Stop affects only optional discovery.
++TLS/header results retain Day 5's transport limits and require application
++context. Historic outputs remain readable but cannot gain missing evidence
++without an explicit new scan. No Exposure Change Detector was added. Stop here.
+diff --git a/frontend/static/app.js b/frontend/static/app.js
+--- a/frontend/static/app.js
++++ b/frontend/static/app.js
+@@ -7,12 +7,29 @@
+   const form = document.getElementById("scan-form");
+   const statusDiv = document.getElementById("scan-status");
+   const startBtn = document.getElementById("start-scan-btn");
++  const pathOption = document.getElementById("path-discovery");
++  const profileOption = document.getElementById("profile");
++  profileOption.addEventListener("change", () => {
++    pathOption.disabled = profileOption.value !== "web";
++    if (pathOption.disabled) pathOption.checked = false;
++  });
++  document.getElementById("stop-path-discovery").addEventListener("click", async () => {
++    if (!currentScanId) return;
++    try {
++      const response = await fetch(`/webscan/${currentScanId}/stop`, {method: "POST"});
++      document.getElementById("path-job-state").textContent = response.ok
++        ? "Stop requested; waiting for the discovery process to exit."
++        : "No optional path job is currently available to stop.";
++    } catch (error) {
++      document.getElementById("path-job-state").textContent = "Could not send the stop request; check the local backend.";
++    }
++  });
+   // Discard old rendered scores/claims once after the evidence rules change.
+-  if (localStorage.getItem("pcvp:evidenceVersion") !== "1") {
+-    for (const key of ["pcvp:lastServicesHtml", "pcvp:lastStats", "pcvp:lastServices", "pcvp:lastGraph", "pcvp:lastGraphText"]) {
++  if (localStorage.getItem("pcvp:evidenceVersion") !== "2") {
++    for (const key of ["pcvp:lastGobusterHtml", "pcvp:lastServicesHtml", "pcvp:lastStats", "pcvp:lastServices", "pcvp:lastGraph", "pcvp:lastGraphText"]) {
+       localStorage.removeItem(key);
+     }
+-    localStorage.setItem("pcvp:evidenceVersion", "1");
++    localStorage.setItem("pcvp:evidenceVersion", "2");
+   }
+ 
+   // Check server boot id to detect backend restarts and avoid restoring stale cached scans
+@@ -289,7 +306,8 @@
+       const resp = await fetch("/scan", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ target, exposure, profile, authorized }),
++        body: JSON.stringify({ target, exposure, profile, authorized,
++          path_discovery: profile === "web" && document.getElementById("path-discovery").checked }),
+       });
+ 
+       if (!resp.ok) {
+@@ -326,6 +344,12 @@
+   const findingsBody = document.querySelector("#findings-table tbody");
+   if (findingsSummary) findingsSummary.textContent = "";
+   if (findingsBody) findingsBody.innerHTML = `<tr><td colspan="5">Waiting for scan to complete...</td></tr>`;
++  for (const id of ["web-assessment", "web-findings", "path-job-state"]) {
++    const element = document.getElementById(id);
++    if (element) element.textContent = "Waiting for this scan's saved web results.";
++  }
++  const stopButton = document.getElementById("stop-path-discovery");
++  if (stopButton) stopButton.disabled = true;
+ }
+ 
+ async function loadScanHistory() {
+@@ -379,7 +403,7 @@
+       <td class="px-3 py-2">${escapeHtml(finding.title || "")}<div>${escapeHtml(finding.domain || "")} / ${escapeHtml(finding.category || "review")}</div><div>Confidence: ${escapeHtml(finding.confidence || "unknown")} (${escapeHtml(finding.confidence_scope || "saved check")})</div></td>
+       <td class="px-3 py-2">${escapeHtml(finding.asset || "")}</td>
+       <td class="px-3 py-2 max-w-xl">${escapeHtml(finding.reason || "")}<pre style="white-space:pre-wrap">${escapeHtml(finding.evidence || "")}</pre>${finding.original_evidence ? `<details><summary>Original evidence</summary><pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(finding.original_evidence, null, 2))}</pre></details>` : ""}</td>
+-      <td class="px-3 py-2">${escapeHtml(finding.source || "")}<div>${escapeHtml(finding.rule_id || "")}</div></td>
++      <td class="px-3 py-2">${escapeHtml(finding.source || "")}<div>${escapeHtml(finding.rule_id || "")}</div><div>Remediation: ${escapeHtml(finding.remediation || "Review saved evidence.")}</div><div>Re-test: ${escapeHtml(finding.retest || "Explicitly repeat the authorized assessment after changes.")}</div></td>
+     `;
+     body.appendChild(tr);
+   }
+@@ -410,6 +434,8 @@
+   updateHeaderScanInfo();
+   document.getElementById("scan-status").textContent = `Viewing scan ${scan.scan_id}`;
+   document.getElementById("profile").value = scan.profile || "standard";
++  document.getElementById("path-discovery").checked = false;
++  document.getElementById("path-discovery").disabled = scan.profile !== "web";
+   resetOverview();
+   setTableLoadingStates();
+   if (scan.status === "completed") {
+@@ -474,6 +500,8 @@
+ 
+       const data = await resp.json();
+       currentExposure = data.exposure || currentExposure;
++      const stopButton = document.getElementById("stop-path-discovery");
++      if (stopButton) stopButton.disabled = !data.path_discovery || !["pending", "running"].includes(data.gobuster_status);
+       updateHeaderScanInfo();
+ 
+       if (data.status === "completed") {
+@@ -512,7 +540,7 @@
+               throw e;
+             }),
+           ]);
+-          statusDiv.textContent = `Scan fully completed (Nmap + Gobuster).`;
++          statusDiv.textContent = data.message || "Assessment completed.";
+           await loadScanHistory();
+         } catch (loadErr) {
+           console.error("[LOADING] Error loading results:", loadErr);
+@@ -525,13 +553,15 @@
+         startBtn.disabled = false;
+         if (reportBtn) reportBtn.disabled = true;
+         statusDiv.textContent = `Scan failed: ${data.message || "unknown error"}`;
++        await Promise.allSettled([loadWebAssessment(scanId), loadGobusterResults(scanId), loadFindings(scanId)]);
+ 
+       } else if (data.status === "nmap_done") {
+         // ✅ Nmap done but gobuster still running
+         if (data.gobuster_status === "completed") {
+           statusDiv.textContent = `Gobuster completed. Finalizing...`;
+         } else {
+-          statusDiv.textContent = `Nmap completed. Waiting for Gobuster to finish...`;
++          statusDiv.textContent = `Nmap completed. HTTP/TLS: ${data.web_status || "pending"}; optional path discovery: ${data.gobuster_status}.`;
++          if (data.web_status === "completed") await loadWebAssessment(scanId);
+         }
+ 
+       } else if (data.status === "running") {
+@@ -701,6 +731,8 @@
+     const resp = await fetch(`/webscan/${scanId}/assessment`);
+     if (!resp.ok) {
+       container.textContent = "Web assessment is not available for this scan.";
++      const findingsView = document.getElementById("web-findings");
++      if (findingsView) findingsView.textContent = "No saved web assessment is available.";
+       return;
+     }
+     const data = await resp.json();
+@@ -725,6 +757,14 @@
+       <ul>${checkRows}</ul>
+       ${data.error ? `<div style="color:#fca5a5;">${escapeHtml(data.error_category || "Assessment error")}: ${escapeHtml(data.error)}</div>` : ""}
+     `;
++    const findingsView = document.getElementById("web-findings");
++    if (findingsView) {
++      const findingsResponse = await fetch(`/webscan/${scanId}/findings`);
++      const rules = findingsResponse.ok ? (await findingsResponse.json()).findings || [] : [];
++      findingsView.innerHTML = `<strong>Independent web configuration findings</strong>` + (rules.length
++        ? rules.map(rule => `<div class="mt-3"><strong>${escapeHtml(rule.rule_id)}: ${escapeHtml(rule.title)}</strong> (${escapeHtml(rule.severity)})<pre style="white-space:pre-wrap">${escapeHtml(rule.evidence)}</pre><div>Remediation: ${escapeHtml(rule.remediation)}</div><div>Re-test: ${escapeHtml(rule.retest)}</div></div>`).join("")
++        : "<div>No rule observations were generated from this saved assessment; this does not establish site security.</div>");
++    }
+   } catch (err) {
+     console.error("[loadWebAssessment] Error:", err);
+     container.textContent = "Error loading web assessment.";
+@@ -744,6 +784,8 @@
+ 
+     const data = await resp.json();
+     const results = data.results || [];
++    const jobState = document.getElementById("path-job-state");
++    if (jobState) jobState.textContent = `Optional path discovery: ${data.discovery_status || "legacy saved output"}${data.partial ? " (incomplete coverage)" : ""}.`;
+     const error = data.error || null;
+     const errorDetail = data.error_detail || null;
+ 
+@@ -759,7 +801,7 @@
+     if (!results.length) {
+       gobBody.innerHTML = `
+         <tr><td colspan="3">
+-          <div>No directories found.</div>
++          <div>${data.discovery_status === "skipped" ? "Path discovery was not requested." : `No paths observed (${escapeHtml(data.discovery_status || "saved output")}); this is not a security verdict.`}</div>
+           ${error ? `<div style="color:#fbbf24; margin-top:4px;">${escapeHtml(error)}</div>` : ""}
+           ${errorDetail ? `<details style="margin-top:6px;"><summary>Technical details</summary><pre style="white-space:pre-wrap; margin-top:4px;">${escapeHtml(errorDetail)}</pre></details>` : ""}
+         </td></tr>`;
+@@ -775,9 +817,9 @@
+     for (const r of results) {
+       const tr = document.createElement("tr");
+       tr.innerHTML = `
+-        <td>${r.path}</td>
+-        <td>${r.status}</td>
+-        <td>${r.size ?? ""}</td>
++        <td>${escapeHtml(r.path)}</td>
++        <td>${escapeHtml(r.status)}</td>
++        <td>${escapeHtml(r.size ?? "")}</td>
+       `;
+       gobBody.appendChild(tr);
+     }
+diff --git a/frontend/templates/index.html b/frontend/templates/index.html
+--- a/frontend/templates/index.html
++++ b/frontend/templates/index.html
+@@ -155,7 +155,7 @@
+               <select id="profile" class="mt-1 w-full min-w-0 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2">
+                 <option value="standard">Standard: up to 1,000 TCP ports, light version detection</option>
+                 <option value="quick">Quick: up to 100 TCP ports</option>
+-                <option value="web">Web: explicit HTTP/TLS and directory assessment</option>
++                <option value="web">Web: HTTP/TLS assessment; optional path discovery</option>
+                 <option value="vulnerability" disabled>Vulnerability assessment (disabled)</option>
+                 <option value="full" disabled>Full lab assessment (disabled)</option>
+               </select>
+@@ -174,6 +174,10 @@
+           <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
+             <input id="authorized" type="checkbox" required />
+             I am authorized to assess this target within the configured approved scope.
++          </label>
++          <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
++            <input id="path-discovery" type="checkbox" disabled />
++            Also discover paths on this exact approved web origin (optional; 15 paths, one worker, 1-second delay).
+           </label>
+         </form>
+       </div>
+@@ -329,11 +333,15 @@
+ 
+     <!-- Web tab -->
+     <section id="tab-web" class="tab-panel hidden space-y-4">
+-      <div class="text-lg font-bold">Web Attack Surface (Gobuster)</div>
++      <div class="text-lg font-bold">Web assessment and optional path observations</div>
+       <div class="glass border border-slate-800 rounded-2xl p-4">
+         <div class="font-bold mb-2">HTTP / TLS security assessment</div>
+         <div id="web-assessment" class="text-sm text-slate-300">Assessment will appear after the scan completes.</div>
+       </div>
++      <div id="web-findings" class="glass border border-slate-800 rounded-2xl p-4">Web configuration findings will appear here.</div>
++      <div class="text-sm text-slate-300">Path responses are observations; a discovered path or HTTP status does not establish a vulnerability.</div>
++      <div id="path-job-state" class="text-sm text-slate-300"></div>
++      <button id="stop-path-discovery" type="button" disabled class="rounded-lg border border-slate-700 px-3 py-2 text-sm disabled:opacity-50">Stop optional path discovery</button>
+       <div class="overflow-auto rounded-2xl border border-slate-800">
+         <table id="gobuster-table" class="min-w-full text-sm">
+           <thead class="bg-slate-900 text-slate-300">
+diff --git a/tests/test_path_discovery.js b/tests/test_path_discovery.js
+new file mode 100644
+--- /dev/null
++++ b/tests/test_path_discovery.js
+@@ -0,0 +1,38 @@
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++const table = {innerHTML: "", appendChild(row) {this.innerHTML += row.innerHTML;}};
++const state = {textContent: ""};
++let result;
++const calls = [];
++const context = vm.createContext({
++  document: {addEventListener() {}, querySelector() {return table;},
++    getElementById() {return state;}, createElement() {return {innerHTML: ""};}},
++  localStorage: {setItem() {}},
++  async fetch(url) {calls.push(url); return {ok: true, async json() {return result;}};},
++});
++const source = fs.readFileSync(path.join(__dirname, "../frontend/static/app.js"), "utf8");
++vm.runInContext(source, context);
++(async () => {
++  result = {results: [{path: "/<script>alert(1)</script>", status: 200, size: 10}], discovery_status: "completed"};
++  await vm.runInContext('loadGobusterResults("saved")', context);
++  assert.match(table.innerHTML, /&lt;script&gt;/);
++  assert.doesNotMatch(table.innerHTML, /<script>|critical|vulnerable/);
++  assert.match(state.textContent, /completed/);
++  result = {results: [], discovery_status: "skipped"};
++  await vm.runInContext('loadGobusterResults("saved")', context);
++  assert.match(table.innerHTML, /not requested/);
++  result = {results: [], discovery_status: "completed"};
++  await vm.runInContext('loadGobusterResults("saved")', context);
++  assert.match(table.innerHTML, /No paths observed/);
++  result = {results: [], discovery_status: "timed_out", partial: true, error: "Discovery timed out"};
++  await vm.runInContext('loadGobusterResults("saved")', context);
++  assert.match(state.textContent, /incomplete coverage/);
++  assert.match(table.innerHTML, /Discovery timed out/);
++  assert.ok(calls.every(url => url === "/webscan/saved/results"));
++  const html = fs.readFileSync(path.join(__dirname, "../frontend/templates/index.html"), "utf8");
++  assert.match(html, /id="path-discovery" type="checkbox" disabled/);
++  assert.match(source, /path_discovery: profile === "web" && document.getElementById\("path-discovery"\).checked/);
++  console.log("PASS: optional path observations render safely with honest job states");
++})().catch(error => {console.error(error); process.exitCode = 1;});
+diff --git a/tests/test_path_discovery.py b/tests/test_path_discovery.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_path_discovery.py
+@@ -0,0 +1,232 @@
++"""No scanner or target is contacted: execute real job code against mocked children."""
++
++import json
++import os
++import threading
++from unittest.mock import Mock, patch
++
++import test_read_only_endpoints as fixtures
++from backend import main
++from backend.scanner import path_discovery as discovery
++from backend.scanner.scan_policy import ConfigurationError, ScopeError
++from backend.scanner.web_assessment import _header_checks
++from backend.scanner.web_rules import build_web_findings
++
++
++class PathDiscoveryTest(fixtures.SavedScanFixture):
++    def setUp(self):
++        super().setUp()
++        self.stack.enter_context(patch.object(main, "DISCOVERY_STOPS", {}))
++        self.status = main.scan_status_store[fixtures.SCAN_ID]
++        self.status.profile = "web"
++        self.status.nmap_status = "completed"
++        self.status.web_url = "http://192.0.2.10:8080"
++        self.status.path_discovery = True
++        self.status.gobuster_status = "pending"
++        self.audit = {"url": self.status.web_url, "http": {"status": 200, "headers": {}},
++                      "checks": [{"name": "Content-Security-Policy", "status": "missing", "detail": "Saved CSP absent"}]}
++        self.assessment = self.stack.enter_context(patch.object(main, "run_web_security_assessment", return_value=self.audit))
++        (self.directory / f"gobuster_{fixtures.SCAN_ID}.txt").unlink()
++
++    def run_job(self, text="/docs (Status: 200) [Size: 10]\n", code=0):
++        process = Mock()
++        process.poll.return_value = code
++        process.wait.return_value = code
++        def launch(command, **kwargs):
++            (self.directory / f"gobuster_{fixtures.SCAN_ID}.txt").write_text(text, encoding="utf-8")
++            return process
++        with patch.object(discovery.subprocess, "Popen", side_effect=launch) as launcher:
++            main.run_gobuster_scan(fixtures.SCAN_ID, self.status.web_url)
++        self.assert_no_external_io()
++        return launcher, process
++
++    def test_successful_discovery_has_exact_origin_rate_limits_and_observations(self):
++        with patch.dict(os.environ, {"HTTPS_PROXY": "https://outside.example:443", "HTTP_PROXY": "http://outside.example:80"}):
++            launcher, process = self.run_job()
++        command = launcher.call_args.args[0]
++        self.assertFalse(launcher.call_args.kwargs["shell"])
++        self.assertEqual(command[command.index("-u") + 1], self.status.web_url)
++        self.assertEqual(command[command.index("-t") + 1], "1")
++        self.assertEqual(command[command.index("--delay") + 1], "1s")
++        self.assertEqual(command[command.index("--timeout") + 1], "5s")
++        for forbidden in ("-k", "-r", "--follow-redirect", "--retry", "-x", "--force", "-U", "-P"):
++            self.assertNotIn(forbidden, command)
++        self.assertNotIn("HTTPS_PROXY", launcher.call_args.kwargs["env"])
++        self.assertEqual(self.status.gobuster_status, "completed")
++        self.assertEqual(self.status.web_status, "completed")
++        result = self.client.get(f"/webscan/{fixtures.SCAN_ID}/results").json()
++        self.assertEqual(result["results"][0]["path"], "/docs")
++        self.assertEqual(result["results"][0]["status"], 200)
++        self.assertEqual(result["results"][0]["category"], "path_observation")
++        self.assertNotIn("severity", result["results"][0])
++        self.assertIn("not established", result["results"][0]["interpretation"])
++        process.kill.assert_not_called()
++        record = json.loads((self.directory / f"gobuster_{fixtures.SCAN_ID}.status").read_text())
++        self.assertEqual(record["word_count"], 15)
++
++    def test_empty_completed_output_has_no_path_observations(self):
++        self.run_job(text="")
++        result = self.client.get(f"/webscan/{fixtures.SCAN_ID}/results").json()
++        self.assertEqual(result["results"], [])
++        self.assertEqual(result["discovery_status"], "completed")
++        self.assertFalse(result["partial"])
++        self.assertIsNone(result["error"])
++
++    def test_missing_gobuster_keeps_independent_web_findings(self):
++        with patch.object(main, "resolve_executable", side_effect=ConfigurationError("gobuster not found")):
++            main.run_gobuster_scan(fixtures.SCAN_ID, self.status.web_url)
++        self.assertEqual(self.status.web_status, "completed")
++        self.assertEqual(self.status.gobuster_status, "failed")
++        result = self.client.get(f"/webscan/{fixtures.SCAN_ID}/results").json()
++        self.assertIn("not found", result["error"])
++        findings = self.client.get(f"/webscan/{fixtures.SCAN_ID}/findings").json()["findings"]
++        self.assertEqual(findings[0]["rule_id"], "WEB-HDR-002")
++        self.assert_no_external_io()
++
++    def test_default_web_request_does_not_require_or_start_gobuster(self):
++        self.status.path_discovery = False
++        with patch.object(main, "resolve_executable", side_effect=AssertionError("Unrequested binary lookup")):
++            main.run_gobuster_scan(fixtures.SCAN_ID, self.status.web_url)
++        self.assertEqual(self.status.web_status, "completed")
++        self.assertEqual(self.status.gobuster_status, "skipped")
++        self.assertEqual(self.client.get(f"/webscan/{fixtures.SCAN_ID}/results").json()["results"], [])
++        self.assert_no_external_io()
++
++    def test_post_web_default_does_not_preflight_gobuster(self):
++        def nmap(scan_id, target, ports):
++            main.scan_status_store[scan_id].nmap_status = "completed"
++        with patch.object(main, "run_nmap_scan", side_effect=nmap), patch.object(main, "resolve_executable", return_value="mock-nmap.exe") as resolver:
++            response = self.client.post("/scan", json={"target": "http://192.0.2.10:8080", "profile": "web", "authorized": True})
++        self.assertEqual(response.status_code, 200)
++        self.assertFalse(response.json()["path_discovery"])
++        self.assertEqual([call.args[1] for call in resolver.call_args_list], ["nmap"])
++        self.assert_no_external_io()
++
++    def test_missing_optional_binary_does_not_fail_completed_assessment_job(self):
++        def nmap(scan_id, target, ports):
++            main.scan_status_store[scan_id].nmap_status = "completed"
++        def executable(variable, program):
++            if program == "gobuster":
++                raise ConfigurationError("Gobuster not installed")
++            return "mock-nmap.exe"
++        with patch.object(main, "run_nmap_scan", side_effect=nmap), patch.object(main, "resolve_executable", side_effect=executable):
++            response = self.client.post("/scan", json={"target": self.status.web_url, "profile": "web", "authorized": True, "path_discovery": True})
++        self.assertEqual(response.status_code, 200)
++        scan_id = response.json()["scan_id"]
++        status = self.client.get(f"/scan/{scan_id}").json()
++        self.assertEqual((status["status"], status["web_status"], status["gobuster_status"]), ("completed", "completed", "failed"))
++        self.assertTrue(self.client.get(f"/webscan/{scan_id}/findings").json()["findings"])
++        self.assert_no_external_io()
++
++    def test_out_of_scope_ip_port_and_scheme_are_rejected_before_any_probe(self):
++        for url in ("http://192.0.3.10:8080", "http://192.0.2.11:8080", "http://192.0.2.10:80", "https://192.0.2.10:8080"):
++            with self.subTest(url=url):
++                main.run_gobuster_scan(fixtures.SCAN_ID, url)
++                self.assertEqual(self.status.gobuster_status, "failed")
++        self.assessment.assert_not_called()
++        self.assert_no_external_io()
++
++    def test_job_timeout_kills_reaps_and_preserves_web_evidence(self):
++        process = Mock()
++        process.poll.return_value = None
++        process.kill.side_effect = lambda: setattr(process.poll, "return_value", -9)
++        with patch.object(discovery.subprocess, "Popen", return_value=process), patch.object(discovery, "monotonic", side_effect=[0, 121]):
++            main.run_gobuster_scan(fixtures.SCAN_ID, self.status.web_url)
++        process.kill.assert_called_once()
++        process.wait.assert_called_with(timeout=5)
++        self.assertEqual(self.status.gobuster_status, "timed_out")
++        self.assertEqual(self.status.web_status, "completed")
++        self.assertEqual(self.client.get(f"/webscan/{fixtures.SCAN_ID}/assessment").json(), self.audit)
++        self.assert_no_external_io()
++
++    def test_operator_stop_kills_the_running_child(self):
++        event = threading.Event()
++        main.DISCOVERY_STOPS[fixtures.SCAN_ID] = event
++        process = Mock()
++        process.poll.return_value = None
++        process.kill.side_effect = lambda: setattr(process.poll, "return_value", -9)
++        def launch(*args, **kwargs):
++            event.set()
++            return process
++        with patch.object(discovery.subprocess, "Popen", side_effect=launch):
++            main.run_gobuster_scan(fixtures.SCAN_ID, self.status.web_url)
++        self.assertEqual(self.status.gobuster_status, "cancelled")
++        process.kill.assert_called_once()
++        process.wait.assert_called_with(timeout=5)
++        self.assertEqual(self.status.web_status, "completed")
++        self.assert_no_external_io()
++
++    def test_stop_endpoint_signals_only_opted_in_pending_job(self):
++        event = threading.Event()
++        main.DISCOVERY_STOPS[fixtures.SCAN_ID] = event
++        response = self.client.post(f"/webscan/{fixtures.SCAN_ID}/stop")
++        self.assertEqual(response.status_code, 200)
++        self.assertTrue(event.is_set())
++        self.status.path_discovery = False
++        self.assertEqual(self.client.post(f"/webscan/{fixtures.SCAN_ID}/stop").status_code, 409)
++        self.assert_no_external_io()
++
++    def test_scope_revocation_during_job_kills_child(self):
++        process = Mock()
++        process.poll.return_value = None
++        process.kill.side_effect = lambda: setattr(process.poll, "return_value", -9)
++        validator = Mock(side_effect=[None, ScopeError("Scope revoked")])
++        with patch.object(discovery.subprocess, "Popen", return_value=process):
++            with self.assertRaises(ScopeError):
++                discovery.execute_discovery("mock-gobuster.exe", self.status.web_url, self.directory / "words", self.directory / "paths.txt", threading.Event(), validator)
++        process.kill.assert_called_once()
++        process.wait.assert_called_with(timeout=5)
++        self.assert_no_external_io()
++
++    def test_nonzero_exit_preserves_failure_with_partial_observations(self):
++        self.run_job(code=9)
++        result = self.client.get(f"/webscan/{fixtures.SCAN_ID}/results").json()
++        self.assertTrue(result["partial"])
++        self.assertIn("code 9", result["error"])
++        self.assertEqual(len(result["results"]), 1)
++
++    def test_unsafe_or_large_wordlists_are_rejected(self):
++        source, target = self.directory / "input.txt", self.directory / "snapshot.txt"
++        for content in ("https://outside.example\n", "../secret\n", "a//b\n", "a?query\n", "\n", "\n".join(f"word{n}" for n in range(33))):
++            with self.subTest(content=content[:20]):
++                source.write_text(content)
++                with self.assertRaises(ConfigurationError):
++                    discovery.prepare_wordlist(source, target)
++
++    def test_parser_skips_noise_deduplicates_and_keeps_evidence(self):
++        source = self.directory / "parser.txt"
++        source.write_text("noise\n//outside.example (Status: 200)\n/docs (Status: 999)\n/docs (Status: 200) [Size: 10]\n/docs (Status: 200) [Size: 10]\n/login (Status: 302) [Size: 0] [--> https://outside.example/]\n")
++        result = main.parse_gobuster_output(source)
++        self.assertEqual([(row["path"], row["status"]) for row in result], [("/docs", 200), ("/login", 302)])
++        self.assertIn("outside.example", result[1]["evidence"])
++        self.assert_no_external_io()
++
++    def test_every_header_and_certificate_rule_has_actionable_fields(self):
++        findings = build_web_findings({"url": "https://192.0.2.10:8080", "http": {"status": 200},
++            "checks": _header_checks({}, "https"), "error_category": "certificate_verification_failed",
++            "error": "synthetic expired certificate", "tls": {"verification": "failed"}})
++        self.assertEqual(len(findings), 7)
++        self.assertEqual(len({item["rule_id"] for item in findings}), 7)
++        for finding in findings:
++            self.assertTrue(all(finding[key] for key in ("id", "rule_id", "evidence", "severity", "remediation", "retest")))
++            self.assertIn(finding["severity"], {"info", "low"})
++            self.assertEqual(finding["domain"], "web")
++
++    def test_valid_headers_and_verified_certificate_produce_no_rule_findings(self):
++        headers = {"strict-transport-security": "max-age=31536000", "content-security-policy": "default-src 'self'",
++                   "x-content-type-options": "nosniff", "x-frame-options": "DENY", "referrer-policy": "no-referrer",
++                   "permissions-policy": "geolocation=()"}
++        self.assertEqual(build_web_findings({"checks": _header_checks(headers, "https"), "tls": {"verification": "verified"}}), [])
++
++    def test_web_findings_do_not_require_network_xml(self):
++        (self.directory / f"{fixtures.SCAN_ID}.xml").unlink()
++        response = self.client.get(f"/webscan/{fixtures.SCAN_ID}/findings")
++        self.assertEqual(response.status_code, 200)
++        self.assertEqual(response.json()["findings"][0]["domain"], "web")
++        self.assert_no_external_io()
++
++    def test_legacy_plain_text_warning_stays_readable(self):
++        (self.directory / f"gobuster_{fixtures.SCAN_ID}.status").write_text("Saved legacy warning", encoding="utf-8")
++        result = self.client.get(f"/webscan/{fixtures.SCAN_ID}/results").json()
++        self.assertEqual(result["error"], "Saved legacy warning")
++        self.assert_no_external_io()
+diff --git a/tests/test_read_only_endpoints.py b/tests/test_read_only_endpoints.py
+--- a/tests/test_read_only_endpoints.py
++++ b/tests/test_read_only_endpoints.py
+@@ -172,12 +172,14 @@
+             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+ 
+         main.scan_status_store[SCAN_ID].nmap_status = "completed"
++        main.scan_status_store[SCAN_ID].path_discovery = True
++        main.scan_status_store[SCAN_ID].web_url = "http://192.0.2.10:8080"
+         audit = {"url": "http://192.0.2.10:8080", "http": {"status": 200}}
+         with patch.object(main, "run_web_security_assessment", return_value=audit) as assessment:
+-            with patch.object(main.subprocess, "run", side_effect=fake_gobuster) as runner:
++            with patch.object(main, "execute_discovery", side_effect=lambda executable, url, words, output, stop, validate: fake_gobuster([executable, "dir", "-o", str(output)]).args) as runner:
+                 main.run_gobuster_scan(SCAN_ID, audit["url"])
+                 assessment.assert_called_once_with(audit["url"])
+-                self.assertEqual(runner.call_args.args[0][:2], ["mock-nmap.exe", "dir"])
++                self.assertEqual(runner.call_args.args[0], "mock-nmap.exe")
+         saved = json.loads((self.directory / f"web_audit_{SCAN_ID}.json").read_text(encoding="utf-8"))
+         self.assertEqual(saved, audit)
+         self.assertEqual(main.scan_status_store[SCAN_ID].gobuster_status, "completed")
+diff --git a/tests/test_scan_execution.py b/tests/test_scan_execution.py
+--- a/tests/test_scan_execution.py
++++ b/tests/test_scan_execution.py
+@@ -230,9 +230,11 @@
+     def test_web_failure_without_stderr_cannot_be_completed(self):
+         status = main.scan_status_store[fixtures.SCAN_ID]
+         status.nmap_status = "completed"
++        status.path_discovery = True
++        status.web_url = "http://192.0.2.10:8080"
+         audit = {"url": "http://192.0.2.10:8080", "checks": []}
+         with patch.object(main, "run_web_security_assessment", return_value=audit):
+-            with patch.object(main.subprocess, "run", return_value=subprocess.CompletedProcess(["gobuster"], 9, "", "")):
++            with patch.object(main, "execute_discovery", side_effect=RuntimeError("Gobuster exited with code 9: No diagnostic output")):
+                 main.run_gobuster_scan(fixtures.SCAN_ID, audit["url"])
+         self.assertEqual(status.gobuster_status, "failed")
+         message = json.loads((self.directory / f"gobuster_{fixtures.SCAN_ID}.status").read_text())
+diff --git a/tests/test_web_assessment.js b/tests/test_web_assessment.js
+--- a/tests/test_web_assessment.js
++++ b/tests/test_web_assessment.js
+@@ -4,13 +4,14 @@
+ const path = require("node:path");
+ const vm = require("node:vm");
+ const container = {innerHTML: "", textContent: ""};
++const findingsContainer = {innerHTML: "", textContent: ""};
+ let data;
+ const calls = [];
+ const context = vm.createContext({
+-  document: {addEventListener() {}, getElementById() {return container;}},
++  document: {addEventListener() {}, getElementById(id) {return id === "web-findings" ? findingsContainer : container;}},
+   async fetch(url) {
+     calls.push(url);
+-    return {ok: true, async json() {return data;}};
++    return {ok: true, async json() {return url.endsWith("/findings") ? {findings: [{rule_id: "WEB-TLS-001", title: "TLS certificate verification failed", severity: "low", evidence: "Untrusted <certificate>", remediation: "Keep verification enabled", retest: "Explicitly repeat Web assessment"}]} : data;}};
+   },
+ });
+ vm.runInContext(fs.readFileSync(path.join(__dirname, "../frontend/static/app.js"), "utf8"), context);
+@@ -22,12 +23,15 @@
+   assert.match(container.innerHTML, /certificate_verification_failed/);
+   assert.match(container.innerHTML, /Untrusted &lt;certificate&gt;/);
+   assert.doesNotMatch(container.innerHTML, /Not HTTPS/);
++  assert.match(findingsContainer.innerHTML, /WEB-TLS-001/);
++  assert.match(findingsContainer.innerHTML, /Keep verification enabled/);
++  assert.match(findingsContainer.innerHTML, /Re-test: Explicitly repeat Web assessment/);
+   data = {url: "http://127.0.0.1/", http: {status: 302, headers: {location: "http://outside.example/"}},
+     tls: {verification: "not_applicable"}, checks: [], redirects: [{followed: false, decision: "blocked"}]};
+   await vm.runInContext('loadWebAssessment("saved")', context);
+   assert.match(container.innerHTML, /302/);
+   assert.match(container.innerHTML, /blocked/);
+   assert.match(container.innerHTML, /Configuration observations/);
+-  assert.deepEqual(calls, ["/webscan/saved/assessment", "/webscan/saved/assessment"]);
++  assert.deepEqual(calls, ["/webscan/saved/assessment", "/webscan/saved/findings", "/webscan/saved/assessment", "/webscan/saved/findings"]);
+   console.log("PASS: saved web evidence and HTTPS failures render truthfully");
+ })().catch(error => {console.error(error); process.exitCode = 1;});
+diff --git a/wordlists/web-safe.txt b/wordlists/web-safe.txt
+new file mode 100644
+--- /dev/null
++++ b/wordlists/web-safe.txt
+@@ -0,0 +1,15 @@
++about
++contact
++docs
++help
++robots.txt
++sitemap.xml
++favicon.ico
++assets
++static
++images
++css
++js
++api
++health
++status

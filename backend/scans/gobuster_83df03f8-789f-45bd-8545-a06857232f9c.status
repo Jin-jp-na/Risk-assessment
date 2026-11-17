@@ -1,0 +1,4 @@
+{
+  "summary": "Gobuster completed with warnings; partial results are available.",
+  "detail": "2026/11/12 13:33:54 the server returns a status code that matches the provided options for non existing urls. https://paramiko.org/8cbc499b-08d6-4e2e-b230-22471cb94402 => 301 (redirect to https://www.paramiko.org/8cbc499b-08d6-4e2e-b230-22471cb94402) (Length: 185). Please exclude the response length or the status code or set the wildcard option.. To continue please exclude the status code or the length"
+}

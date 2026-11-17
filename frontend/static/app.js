@@ -7,6 +7,30 @@ document.addEventListener("DOMContentLoaded", async () => {
   const form = document.getElementById("scan-form");
   const statusDiv = document.getElementById("scan-status");
   const startBtn = document.getElementById("start-scan-btn");
+  const pathOption = document.getElementById("path-discovery");
+  const profileOption = document.getElementById("profile");
+  profileOption.addEventListener("change", () => {
+    pathOption.disabled = profileOption.value !== "web";
+    if (pathOption.disabled) pathOption.checked = false;
+  });
+  document.getElementById("stop-path-discovery").addEventListener("click", async () => {
+    if (!currentScanId) return;
+    try {
+      const response = await fetch(`/webscan/${currentScanId}/stop`, {method: "POST"});
+      document.getElementById("path-job-state").textContent = response.ok
+        ? "Stop requested; waiting for the discovery process to exit."
+        : "No optional path job is currently available to stop.";
+    } catch (error) {
+      document.getElementById("path-job-state").textContent = "Could not send the stop request; check the local backend.";
+    }
+  });
+  // Discard old rendered scores/claims once after the evidence rules change.
+  if (localStorage.getItem("pcvp:evidenceVersion") !== "2") {
+    for (const key of ["pcvp:lastGobusterHtml", "pcvp:lastServicesHtml", "pcvp:lastStats", "pcvp:lastServices", "pcvp:lastGraph", "pcvp:lastGraphText"]) {
+      localStorage.removeItem(key);
+    }
+    localStorage.setItem("pcvp:evidenceVersion", "2");
+  }
 
   // Check server boot id to detect backend restarts and avoid restoring stale cached scans
   try {
@@ -28,154 +52,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   const saved = localStorage.getItem("pcvp:lastScanId");
   if (saved) {
-    try {
-      const resp = await fetch(`/scan/${saved}`);
-      if (resp.ok) {
-        currentScanId = saved;
-        statusDiv.textContent = `Restored last scan: ${currentScanId}`;
-        updateHeaderScanInfo();
-
-        const cachedHtml = localStorage.getItem("pcvp:lastServicesHtml");
-        const cachedStats = localStorage.getItem("pcvp:lastStats");
-        const cachedServices = localStorage.getItem("pcvp:lastServices");
-        let hasCachedServices = false;
-
-        if (cachedServices) {
-        try {
-          currentServices = JSON.parse(cachedServices);
-          hasCachedServices = true;
-        } catch (e) {}
-      }
-
-      if (cachedHtml) {
-        document.querySelector("#services-table tbody").innerHTML = cachedHtml;
-        // ✅ Re-attach click listeners after restoring HTML
-        document.querySelector("#services-table tbody")
-          .querySelectorAll(".btn-link")
-          .forEach((btn) => btn.addEventListener("click", onDetailsClick));
-        hasCachedServices = true;
-      }
-
-
-        if (cachedStats) {
-          const stats = JSON.parse(cachedStats);
-          document.getElementById("stat-hosts").textContent = stats.hosts || "0";
-          document.getElementById("stat-services").textContent = stats.services || "0";
-          document.getElementById("stat-critical").textContent = stats.critical || "0 / 0";
-          document.getElementById("stat-weak-creds").textContent = stats.weak || "0";
-          hasCachedServices = true;
-        }
-
-       const cachedGraphText = localStorage.getItem("pcvp:lastGraphText");
-const cachedGraph = localStorage.getItem("pcvp:lastGraph");
-let hasCachedGraph = false;
-
-if (cachedGraphText) {
-  document.getElementById("attack-graph-content").innerHTML = cachedGraphText;
-  hasCachedGraph = true;
-}
-
-// ✅ Re-render vis.js network from cached graph data
-if (cachedGraph) {
-  try {
-    const graph = JSON.parse(cachedGraph);
-    const nodes = graph.nodes || [];
-    const edges = graph.edges || [];
-    const graphContainer = document.getElementById("attack-graph-network");
-    graphContainer.innerHTML = "";
-
-    if (nodes.length && edges.length) {
-      const visNodes = new vis.DataSet(
-        nodes.map((n) => {
-          let label = n.id, color = "#6b7280", shape = "ellipse";
-          if (n.type === "host") { label = n.ip || n.id; color = "#1d4ed8"; shape = "box"; }
-          else if (n.type === "service") {
-            const level = (n.pcvp_level || "").toLowerCase();
-            label = `${n.service || "svc"}\n${n.port || ""}/${n.protocol || ""}`;
-            if (level === "critical") color = "#dc2626";
-            else if (level === "high") color = "#f97316";
-            else if (level === "medium") color = "#eab308";
-            else if (level === "low") color = "#22c55e";
-            else color = "#6b7280";
-          } else if (n.type === "cve") { 
-            label = n.cve_id || "CVE"; 
-            color = "#0ea5e9"; 
-            shape = "diamond"; 
-          }
-          return { id: n.id, label, color, shape, font: { color: "#e5e7eb", size: 12 } };
-        })
-      );
-
-      const visEdges = new vis.DataSet(
-        edges.map((e) => {
-          let color = "#4b5563", dashes = false, label = "";
-          if (e.relation === "runs") { label = "runs"; color = "#6b7280"; }
-          else if (e.relation === "has_vulnerability") { label = "has CVE"; color = "#0ea5e9"; }
-          else if (e.relation === "possible_chain") { label = "pivot"; color = "#f97316"; dashes = true; }
-          return { from: e.from, to: e.to, color, dashes, arrows: "to", label, font: { align: "middle", color: "#9ca3af", size: 10 } };
-        })
-      );
-
-      new vis.Network(graphContainer, { nodes: visNodes, edges: visEdges }, {
-        autoResize: true,
-        physics: { stabilization: true, barnesHut: { springLength: 120, springConstant: 0.01 } },
-        interaction: { tooltipDelay: 200, hover: true },
-        nodes: { borderWidth: 1 },
-        layout: { improvedLayout: true },
-      });
-    }
-  } catch (e) {
-    console.error("Failed to restore attack graph network:", e);
+    try { await restoreHistoricalScan(saved); }
+    catch (error) { statusDiv.textContent = "Saved results are unavailable: " + error.message; }
   }
-}
-
-        const cachedGobuster = localStorage.getItem("pcvp:lastGobusterHtml");
-        let hasCachedGobuster = false;
-        if (cachedGobuster) {
-          document.querySelector("#gobuster-table tbody").innerHTML = cachedGobuster;
-          hasCachedGobuster = true;
-        }
-
-       if (!hasCachedServices) loadScanResults(currentScanId);
-       loadAliveHosts(currentScanId);
-       loadWebAssessment(currentScanId);
-       if (!hasCachedGobuster) loadGobusterResults(currentScanId);
-       if (!hasCachedGraph) loadAttackGraph(currentScanId);
-
-        // ✅ Only poll if scan is not already completed
-        const scanData = await fetch(`/scan/${currentScanId}`).then(r => r.json());
-        if (scanData.status !== "completed") {
-          pollScanStatus(currentScanId);
-        } else {
-          statusDiv.textContent = `Restored last scan: ${currentScanId}`;
-          const reportBtn = document.getElementById("download-report-btn");
-          if (reportBtn) reportBtn.disabled = false;
-        }
-      } else {
-        localStorage.removeItem("pcvp:lastScanId");
-        localStorage.removeItem("pcvp:lastServicesHtml");
-        localStorage.removeItem("pcvp:lastStats");
-        localStorage.removeItem("pcvp:lastServices");
-        localStorage.removeItem("pcvp:lastGobusterHtml");
-        localStorage.removeItem("pcvp:lastGraphText");
-        resetOverview();
-        setTableLoadingStates();
-        updateHeaderScanInfo();
-        statusDiv.textContent = "";
-      }
-    } catch (e) {
-      localStorage.removeItem("pcvp:lastScanId");
-      localStorage.removeItem("pcvp:lastServicesHtml");
-      localStorage.removeItem("pcvp:lastStats");
-      localStorage.removeItem("pcvp:lastGobusterHtml");
-      localStorage.removeItem("pcvp:lastGraphText");
-      resetOverview();
-      setTableLoadingStates();
-      updateHeaderScanInfo();
-      statusDiv.textContent = "";
-    }
-  }
-
+  document.getElementById("compare-scans-btn").addEventListener("click", compareSelectedScans);
+  document.getElementById("compare-pdf").addEventListener("click", () => exportComparison("pdf"));
+  document.getElementById("compare-csv").addEventListener("click", () => exportComparison("csv"));
   const savedTarget = localStorage.getItem("pcvp:lastTarget");
   const savedExposure = localStorage.getItem("pcvp:lastExposure");
   if (savedTarget) document.getElementById("target").value = savedTarget;
@@ -254,15 +136,10 @@ if (cachedGraph) {
     localStorage.removeItem("pcvp:lastGobusterHtml");
     localStorage.removeItem("pcvp:lastGraphText");
 
-    // ✅ Clear remediation cache for old scan
-    for (const key of Object.keys(localStorage)) {
-      if (key.startsWith("pcvp:remediation:")) {
-        localStorage.removeItem(key);
-      }
-    }
     const target = document.getElementById("target").value.trim();
     const exposure = document.getElementById("exposure").value;
     const profile = document.getElementById("profile").value;
+    const authorized = document.getElementById("authorized").checked;
 
     if (!target) {
       statusDiv.textContent = "Please enter a target.";
@@ -287,11 +164,13 @@ if (cachedGraph) {
       const resp = await fetch("/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target, exposure, profile }),
+        body: JSON.stringify({ target, exposure, profile, authorized, network_scan: profile !== "web",
+          path_discovery: profile === "web" && document.getElementById("path-discovery").checked }),
       });
 
       if (!resp.ok) {
-        statusDiv.textContent = `Error starting scan: ${resp.status}`;
+        const error = await resp.json().catch(() => ({}));
+        statusDiv.textContent = `Error starting scan: ${error.detail || resp.status}`;
         startBtn.disabled = false;
         return;
       }
@@ -323,6 +202,12 @@ function resetOverview() {
   const findingsBody = document.querySelector("#findings-table tbody");
   if (findingsSummary) findingsSummary.textContent = "";
   if (findingsBody) findingsBody.innerHTML = `<tr><td colspan="5">Waiting for scan to complete...</td></tr>`;
+  for (const id of ["web-assessment", "web-findings", "path-job-state"]) {
+    const element = document.getElementById(id);
+    if (element) element.textContent = "Waiting for this scan's saved web results.";
+  }
+  const stopButton = document.getElementById("stop-path-discovery");
+  if (stopButton) stopButton.disabled = true;
 }
 
 async function loadScanHistory() {
@@ -332,6 +217,7 @@ async function loadScanHistory() {
     const response = await fetch("/scans/history");
     if (!response.ok) throw new Error(`History request failed: ${response.status}`);
     const scans = await response.json();
+    populateComparisonSelectors(scans);
     if (!scans.length) {
       body.innerHTML = `<tr><td colspan="6" class="px-3 py-2">No scans recorded yet.</td></tr>`;
       return;
@@ -362,8 +248,7 @@ async function loadFindings(scanId) {
     return;
   }
   const data = await resp.json();
-  const counts = data.summary || {};
-  summary.textContent = `Critical: ${counts.critical || 0} · High: ${counts.high || 0} · Medium: ${counts.medium || 0} · Low: ${counts.low || 0}`;
+  summary.textContent = `Observed open services: ${(data.network_observations || []).filter(o => o.state === "open").length} · Unverified CVE candidates: ${(data.candidate_vulnerabilities || []).length} · Web recommendations: ${(data.findings || []).filter(f => f.domain === "web").length}`;
   const findings = data.findings || [];
   if (!findings.length) {
     body.innerHTML = `<tr><td colspan="5">No findings were generated.</td></tr>`;
@@ -374,10 +259,10 @@ async function loadFindings(scanId) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td class="px-3 py-2"><span class="badge badge-${escapeHtml(finding.severity || "info")}">${escapeHtml(finding.severity || "info")}</span></td>
-      <td class="px-3 py-2">${escapeHtml(finding.title || "")}</td>
+      <td class="px-3 py-2">${escapeHtml(finding.title || "")}<div>${escapeHtml(finding.domain || "")} / ${escapeHtml(finding.category || "review")}</div><div>Confidence: ${escapeHtml(finding.confidence || "unknown")} (${escapeHtml(finding.confidence_scope || "saved check")})</div></td>
       <td class="px-3 py-2">${escapeHtml(finding.asset || "")}</td>
-      <td class="px-3 py-2 max-w-xl">${escapeHtml(finding.evidence || "")}</td>
-      <td class="px-3 py-2">${escapeHtml(finding.source || "")}</td>
+      <td class="px-3 py-2 max-w-xl">${escapeHtml(finding.reason || "")}<pre style="white-space:pre-wrap">${escapeHtml(finding.evidence || "")}</pre>${finding.original_evidence ? `<details><summary>Original evidence</summary><pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(finding.original_evidence, null, 2))}</pre></details>` : ""}</td>
+      <td class="px-3 py-2">${escapeHtml(finding.source || "")}<div>${escapeHtml(finding.rule_id || "")}</div><div>Remediation: ${escapeHtml(finding.remediation || "Review saved evidence.")}</div><div>Re-test: ${escapeHtml(finding.retest || "Explicitly repeat the authorized assessment after changes.")}</div></td>
     `;
     body.appendChild(tr);
   }
@@ -408,17 +293,12 @@ async function restoreHistoricalScan(scanId) {
   updateHeaderScanInfo();
   document.getElementById("scan-status").textContent = `Viewing scan ${scan.scan_id}`;
   document.getElementById("profile").value = scan.profile || "standard";
+  document.getElementById("path-discovery").checked = false;
+  document.getElementById("path-discovery").disabled = scan.profile !== "web";
   resetOverview();
   setTableLoadingStates();
-  if (scan.status === "completed") {
-    await Promise.all([
-      loadScanResults(scan.scan_id),
-      loadFindings(scan.scan_id),
-      loadAliveHosts(scan.scan_id),
-      loadGobusterResults(scan.scan_id),
-      loadWebAssessment(scan.scan_id),
-      loadAttackGraph(scan.scan_id),
-    ]);
+  if (["completed", "failed", "partial", "cancelled"].includes(scan.status)) {
+    await renderSavedScan(scan.scan_id);
     document.getElementById("download-report-btn").disabled = false;
   } else {
     pollScanStatus(scan.scan_id);
@@ -472,6 +352,8 @@ function pollScanStatus(scanId) {
 
       const data = await resp.json();
       currentExposure = data.exposure || currentExposure;
+      const stopButton = document.getElementById("stop-path-discovery");
+      if (stopButton) stopButton.disabled = !data.path_discovery || !["pending", "running"].includes(data.gobuster_status);
       updateHeaderScanInfo();
 
       if (data.status === "completed") {
@@ -484,33 +366,8 @@ function pollScanStatus(scanId) {
         statusDiv.textContent = `Loading results...`;
 
         try {
-          await Promise.all([
-            loadScanResults(scanId).catch(e => {
-              console.error("[LOADING] loadScanResults failed:", e);
-              throw e;
-            }),
-            loadFindings(scanId).catch(e => {
-              console.error("[LOADING] loadFindings failed:", e);
-              throw e;
-            }),
-            loadAliveHosts(scanId).catch(e => {
-              console.error("[LOADING] loadAliveHosts failed:", e);
-              throw e;
-            }),
-            loadGobusterResults(scanId).catch(e => {
-              console.error("[LOADING] loadGobusterResults failed:", e);
-              throw e;
-            }),
-            loadWebAssessment(scanId).catch(e => {
-              console.error("[LOADING] loadWebAssessment failed:", e);
-              throw e;
-            }),
-            loadAttackGraph(scanId).catch(e => {
-              console.error("[LOADING] loadAttackGraph failed:", e);
-              throw e;
-            }),
-          ]);
-          statusDiv.textContent = `Scan fully completed (Nmap + Gobuster).`;
+          await renderSavedScan(scanId);
+          statusDiv.textContent = data.message || "Assessment completed.";
           await loadScanHistory();
         } catch (loadErr) {
           console.error("[LOADING] Error loading results:", loadErr);
@@ -523,13 +380,17 @@ function pollScanStatus(scanId) {
         startBtn.disabled = false;
         if (reportBtn) reportBtn.disabled = true;
         statusDiv.textContent = `Scan failed: ${data.message || "unknown error"}`;
+        await renderSavedScan(scanId);
+        if (reportBtn) reportBtn.disabled = false;
+        await loadScanHistory();
 
       } else if (data.status === "nmap_done") {
         // ✅ Nmap done but gobuster still running
         if (data.gobuster_status === "completed") {
           statusDiv.textContent = `Gobuster completed. Finalizing...`;
         } else {
-          statusDiv.textContent = `Nmap completed. Waiting for Gobuster to finish...`;
+          statusDiv.textContent = `${data.network_scan === false ? "Web assessment running" : "Nmap completed"}. HTTP/TLS: ${data.web_status || "pending"}; optional path discovery: ${data.gobuster_status}.`;
+          if (data.web_status === "completed") await loadWebAssessment(scanId);
         }
 
       } else if (data.status === "running") {
@@ -557,7 +418,7 @@ function pollScanStatus(scanId) {
 
 async function loadScanResults(scanId) {
   const servicesBody = document.querySelector("#services-table tbody");
-  servicesBody.innerHTML = `<tr><td colspan="9">Loading NVD/RiskLens data...</td></tr>`;
+  servicesBody.innerHTML = `<tr><td colspan="9">Loading saved RiskLens data...</td></tr>`;
   currentServices = [];
 
   try {
@@ -622,19 +483,19 @@ for (const svc of rows) {
     level === "low" ? "badge-low" : "badge-info";
   const weakCredsText = svc.weak_creds && svc.weak_creds.found
     ? `${svc.weak_creds.protocol || ""} ${svc.weak_creds.username}:${svc.weak_creds.password}`
-    : "None";
+    : "Not tested";
   const weakPillClass = svc.weak_creds && svc.weak_creds.found ? "pill pill-weak" : "pill";
   const nseCount = Array.isArray(svc.nse_findings) ? svc.nse_findings.length : 0;
   tr.innerHTML = `
-    <td>${svc.ip || ""}</td>
+    <td>${escapeHtml(svc.ip || "")}</td>
     <td>${svc.port}</td>
-    <td>${svc.service || ""}</td>
-    <td>${(svc.product || "") + " " + (svc.version || "")}</td>
+    <td>${escapeHtml(svc.service || "")} (${escapeHtml(svc.state || "unknown")})</td>
+    <td>${escapeHtml((svc.product || "unknown") + " " + (svc.version || "unknown"))}</td>
     <td><span class="badge ${badgeClass}">${level}</span></td>
     <td>${svc.pcvp_score ?? ""}</td>
     <td><span class="${weakPillClass}">${weakCredsText}</span></td>
-    <td>${nseCount ? `<span class="pill pill-weak">${nseCount} finding(s)</span>` : "None"}</td>
-    <td><button class="btn-link" data-ip="${svc.ip}" data-port="${svc.port}" data-proto="${svc.protocol}">Details</button></td>
+    <td>${nseCount ? `<span class="pill">${nseCount} saved output(s)</span>` : "None"}</td>
+    <td><button class="btn-link" data-ip="${escapeHtml(svc.ip)}" data-port="${svc.port}" data-proto="${escapeHtml(svc.protocol)}">Details</button></td>
   `;
   servicesBody.appendChild(tr);
 }
@@ -647,7 +508,7 @@ localStorage.setItem("pcvp:lastServicesHtml", servicesBody.innerHTML);
 } catch (err) {
   console.error("[loadScanResults] CATCH ERROR:", err.name, err.message);
   console.error("[loadScanResults] Full error:", err);
-  servicesBody.innerHTML = `<tr><td colspan="9">Error loading NVD/RiskLens data: ${err.message}</td></tr>`;
+  servicesBody.innerHTML = `<tr><td colspan="9">Error loading saved observations: ${err.message}</td></tr>`;
 }
 }
 
@@ -699,6 +560,8 @@ async function loadWebAssessment(scanId) {
     const resp = await fetch(`/webscan/${scanId}/assessment`);
     if (!resp.ok) {
       container.textContent = "Web assessment is not available for this scan.";
+      const findingsView = document.getElementById("web-findings");
+      if (findingsView) findingsView.textContent = "No saved web assessment is available.";
       return;
     }
     const data = await resp.json();
@@ -710,16 +573,27 @@ async function loadWebAssessment(scanId) {
       : "<li>No HTTP checks returned.</li>";
     const technologyText = technologies.length
       ? technologies.map(item => `${item.name}: ${item.evidence}`).join(", ")
-      : "No technology signatures detected";
+      : "No technology evidence recorded";
     container.innerHTML = `
       <div><strong>Final URL:</strong> ${escapeHtml(data.http?.final_url || data.url || "")}</div>
       <div><strong>HTTP status:</strong> ${escapeHtml(data.http?.status ?? "Unavailable")}</div>
       <div><strong>Technologies:</strong> ${escapeHtml(technologyText)}</div>
-      <div><strong>TLS:</strong> ${escapeHtml(tls.protocol || "Not HTTPS")} ${tls.cipher ? `(${escapeHtml(tls.cipher)})` : ""}</div>
-      <div class="section-title">Security checks</div>
+      <div><strong>Assessment:</strong> ${escapeHtml(data.status || "Saved assessment (legacy)")}</div>
+      <div><strong>TLS:</strong> ${escapeHtml(tls.protocol || (String(data.url || "").startsWith("https:") ? "Unavailable" : "Not HTTPS"))} ${tls.cipher ? `(${escapeHtml(tls.cipher)})` : ""}; verification: ${escapeHtml(tls.verification || "Not recorded")}</div>
+      ${tls.subject ? `<div><strong>Certificate:</strong> ${escapeHtml(tls.subject)}; issuer: ${escapeHtml(tls.issuer || "")}; expires: ${escapeHtml(tls.expires || "Not recorded")}</div>` : ""}
+      <details><summary>Saved HTTP/TLS evidence and redirect decisions</summary><pre>${escapeHtml(JSON.stringify({http: data.http || {}, tls, redirects: data.redirects || []}, null, 2))}</pre></details>
+      <div class="section-title">Configuration observations (impact requires review)</div>
       <ul>${checkRows}</ul>
-      ${data.error ? `<div style="color:#fca5a5;">${escapeHtml(data.error)}</div>` : ""}
+      ${data.error ? `<div style="color:#fca5a5;">${escapeHtml(data.error_category || "Assessment error")}: ${escapeHtml(data.error)}</div>` : ""}
     `;
+    const findingsView = document.getElementById("web-findings");
+    if (findingsView) {
+      const findingsResponse = await fetch(`/webscan/${scanId}/findings`);
+      const rules = findingsResponse.ok ? (await findingsResponse.json()).findings || [] : [];
+      findingsView.innerHTML = `<strong>Independent web configuration findings</strong>` + (rules.length
+        ? rules.map(rule => `<div class="mt-3"><strong>${escapeHtml(rule.rule_id)}: ${escapeHtml(rule.title)}</strong> (${escapeHtml(rule.severity)})<pre style="white-space:pre-wrap">${escapeHtml(rule.evidence)}</pre><div>Remediation: ${escapeHtml(rule.remediation)}</div><div>Re-test: ${escapeHtml(rule.retest)}</div></div>`).join("")
+        : "<div>No rule observations were generated from this saved assessment; this does not establish site security.</div>");
+    }
   } catch (err) {
     console.error("[loadWebAssessment] Error:", err);
     container.textContent = "Error loading web assessment.";
@@ -739,6 +613,8 @@ async function loadGobusterResults(scanId) {
 
     const data = await resp.json();
     const results = data.results || [];
+    const jobState = document.getElementById("path-job-state");
+    if (jobState) jobState.textContent = `Optional path discovery: ${data.discovery_status || "legacy saved output"}${data.partial ? " (incomplete coverage)" : ""}.`;
     const error = data.error || null;
     const errorDetail = data.error_detail || null;
 
@@ -754,7 +630,7 @@ async function loadGobusterResults(scanId) {
     if (!results.length) {
       gobBody.innerHTML = `
         <tr><td colspan="3">
-          <div>No directories found.</div>
+          <div>${data.discovery_status === "skipped" ? "Path discovery was not requested." : `No paths observed (${escapeHtml(data.discovery_status || "saved output")}); this is not a security verdict.`}</div>
           ${error ? `<div style="color:#fbbf24; margin-top:4px;">${escapeHtml(error)}</div>` : ""}
           ${errorDetail ? `<details style="margin-top:6px;"><summary>Technical details</summary><pre style="white-space:pre-wrap; margin-top:4px;">${escapeHtml(errorDetail)}</pre></details>` : ""}
         </td></tr>`;
@@ -770,9 +646,9 @@ async function loadGobusterResults(scanId) {
     for (const r of results) {
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td>${r.path}</td>
-        <td>${r.status}</td>
-        <td>${r.size ?? ""}</td>
+        <td>${escapeHtml(r.path)}</td>
+        <td>${escapeHtml(r.status)}</td>
+        <td>${escapeHtml(r.size ?? "")}</td>
       `;
       gobBody.appendChild(tr);
     }
@@ -811,41 +687,7 @@ async function loadAttackGraph(scanId) {
     const nodeById = {};
     nodes.forEach((n) => (nodeById[n.id] = n));
 
-    const visNodes = new vis.DataSet(
-      nodes.map((n) => {
-        let label = n.id, color = "#6b7280", shape = "ellipse";
-        if (n.type === "host") { label = n.ip || n.id; color = "#1d4ed8"; shape = "box"; }
-        else if (n.type === "service") {
-          const level = (n.pcvp_level || "").toLowerCase();
-          label = `${n.service || "svc"}\n${n.port || ""}/${n.protocol || ""}`;
-          if (level === "critical") color = "#dc2626";
-          else if (level === "high") color = "#f97316";
-          else if (level === "medium") color = "#eab308";
-          else if (level === "low") color = "#22c55e";
-          else color = "#6b7280";
-        } else if (n.type === "cve") { label = n.cve_id || "CVE"; color = "#0ea5e9"; shape = "diamond"; }
-        return { id: n.id, label, color, shape, font: { color: "#e5e7eb", size: 12 } };
-      })
-    );
-
-    const visEdges = new vis.DataSet(
-      edges.map((e) => {
-        let color = "#4b5563", dashes = false, label = "";
-        if (e.relation === "runs") { label = "runs"; color = "#6b7280"; }
-        else if (e.relation === "has_vulnerability") { label = "has CVE"; color = "#0ea5e9"; }
-        else if (e.relation === "possible_chain") { label = "pivot"; color = "#f97316"; dashes = true; }
-        return { from: e.from, to: e.to, color, dashes, arrows: "to", label, font: { align: "middle", color: "#9ca3af", size: 10 } };
-      })
-    );
-
-    new vis.Network(graphContainer, { nodes: visNodes, edges: visEdges }, {
-      autoResize: true,
-      physics: { stabilization: true, barnesHut: { springLength: 120, springConstant: 0.01 } },
-      interaction: { tooltipDelay: 200, hover: true },
-      nodes: { borderWidth: 1 },
-      layout: { improvedLayout: true },
-    });
-
+    graphContainer.innerHTML = renderLocalGraph(graph);
     const hostServices = {};
     edges.forEach((e) => {
       if (e.relation === "runs") {
@@ -864,7 +706,7 @@ async function loadAttackGraph(scanId) {
         const level = (svc.pcvp_level || "").toLowerCase();
         const score = svc.pcvp_score || 0;
         if (!(level === "critical" || level === "high")) continue;
-        const cveEdges = edges.filter((e) => e.from === sid && e.relation === "has_vulnerability");
+        const cveEdges = edges.filter((e) => e.from === sid && (e.relation === "candidate_cve" || e.relation === "has_vulnerability"));
         const cveIds = cveEdges.map((e) => nodeById[e.to]).filter(Boolean).map((c) => c.cve_id || c.id || c.name).filter(Boolean);
         const chainEdges = edges.filter((e) => e.from === sid && e.relation === "possible_chain");
         const nextServices = chainEdges.map((e) => nodeById[e.to]).filter(Boolean).map((ns) => `${ns.service || "service"} on ${ns.ip || hostIp}:${ns.port}`);
@@ -872,15 +714,15 @@ async function loadAttackGraph(scanId) {
       }
     }
 if (!chains.length) {
-  textContainer.textContent = "No high/critical attack paths identified. Lower-risk services may exist but no strong chains.";
+  textContainer.textContent = "No high-priority services. This view does not establish exploitability or attack paths.";
 } else {
   let html = "<ul>";
   for (const ch of chains) {
     html += "<li style='margin-bottom:6px;'>";
     html += `<strong>${ch.service}</strong> on <strong>${ch.hostIp}:${ch.port}</strong> `;
-    html += `(RiskLens: ${ch.level.toUpperCase()} score ${ch.score})`;
-    if (ch.cves.length) { html += "<br><span style='color:#9ca3af;'>Exploitable via:</span> " + ch.cves.map((id) => `<code>${id}</code>`).join(", "); }
-    if (ch.nextServices.length) { html += "<br><span style='color:#9ca3af;'>Potential pivot to:</span> " + ch.nextServices.join(", "); }
+    html += `(Review priority: ${ch.level.toUpperCase()} score ${ch.score})`;
+    if (ch.cves.length) { html += "<br><span style='color:#9ca3af;'>Unverified CVE candidates:</span> " + ch.cves.map((id) => `<code>${id}</code>`).join(", "); }
+    if (ch.nextServices.length) { html += "<br><span style='color:#9ca3af;'>Unverified association with:</span> " + ch.nextServices.join(", "); }
     html += "</li>";
   }
   html += "</ul>";
@@ -896,52 +738,6 @@ localStorage.setItem("pcvp:lastGraphText", textContainer.innerHTML || textContai
   }
 }
 
-async function loadLLMRemediation(scanId, svc) {
-  const el = document.getElementById("llm-remediation");
-  if (!el) return;
-
-  // ✅ Check cache first
-  const cacheKey = `pcvp:remediation:${scanId}:${svc.ip}:${svc.port}:${svc.protocol || "tcp"}`;
-  const cached = localStorage.getItem(cacheKey);
-  if (cached) {
-    el.innerHTML = cached;
-    return;
-  }
-
-  el.innerHTML = `<div style="color:#9ca3af;">Generating remediation...</div>`;
-
-  try {
-    const resp = await fetch(`/scan/${scanId}/remediation`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ scan_id: scanId, ip: svc.ip, port: svc.port, protocol: svc.protocol || "tcp" }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      el.innerHTML = `<div style="color:#fca5a5;">Failed: ${escapeHtml(data.detail || `HTTP ${resp.status}`)}</div>`;
-      return;
-    }
-    const r = data.remediation || {};
-    const steps = Array.isArray(r.steps) ? r.steps : [];
-    const verification = Array.isArray(r.verification) ? r.verification : [];
-    const refs = Array.isArray(r.references) ? r.references : [];
-
-    const html = `
-      <div><strong>Summary:</strong> ${escapeHtml(r.summary || "")}</div>
-      <div><strong>Priority:</strong> ${escapeHtml(r.priority || "")}</div>
-      ${steps.length ? `<div class="section-title">Recommended Steps</div><ul>${steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>` : `<div style="color:#9ca3af; margin-top:6px;">No steps returned.</div>`}
-      ${verification.length ? `<div class="section-title">Verification</div><ul>${verification.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>` : ""}
-      ${refs.length ? `<div class="section-title">References</div><ul>${refs.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>` : ""}
-    `;
-
-    el.innerHTML = html;
-    // ✅ Save to cache
-    localStorage.setItem(cacheKey, html);
-  } catch (err) {
-    console.error(err);
-    el.innerHTML = `<div style="color:#fca5a5;">Error generating remediation (see console).</div>`;
-  }
-}
 function onDetailsClick(e) {
   const ip = e.target.getAttribute("data-ip");
   const port = parseInt(e.target.getAttribute("data-port"), 10);
@@ -959,28 +755,29 @@ function onDetailsClick(e) {
   const cves = nvd.cves || nvd.CVEs || [];
 
   let html = "";
-  html += `<div><strong>Product:</strong> ${escapeHtml(svc.product || "")} ${escapeHtml(svc.version || "")}</div>`;
+  html += `<div><strong>Observed product/version:</strong> ${escapeHtml(svc.product || "unknown")} ${escapeHtml(svc.version || "unknown")}</div>`;
+  html += `<div>Identity confidence: ${escapeHtml(svc.identity_confidence || "unknown")}. ${escapeHtml(svc.identity_reason || "Scanner observations require verification.")}</div>`;
   html += `<div><strong>Exposure:</strong> ${escapeHtml(currentExposure || "auto")}</div>`;
-  html += `<div><strong>RiskLens:</strong> ${escapeHtml(svc.pcvp_level || "")} (score ${svc.pcvp_score ?? ""})</div>`;
+  html += `<div><strong>Exposure review priority:</strong> ${escapeHtml(svc.pcvp_level || "")} (score ${svc.pcvp_score ?? ""}/25). Vulnerability severity: informational.</div>`;
   if (svc.weak_creds && svc.weak_creds.found) {
     html += `<div style="margin-top:4px;"><strong>Weak Credentials:</strong> ${escapeHtml(`${svc.weak_creds.protocol || ""} ${svc.weak_creds.username}:${svc.weak_creds.password}`)}</div>`;
   }
   html += `<div class="section-title">Why this is prioritized</div>`;
   if (reasons.length) { html += "<ul>"; for (const r of reasons) html += `<li>${escapeHtml(r)}</li>`; html += "</ul>"; }
   else { html += "<div>No reasons available.</div>"; }
-  html += `<div class="section-title">Mapped CVEs</div>`;
+  html += `<div class="section-title">Unverified CVE candidates — applicability not established</div>`;
   if (cves.length) {
     html += "<ul>";
     for (const c of cves) {
       const id = c.cve_id || c.id || "Unknown";
-      const sev = c.severity || c.SEVERITY || "Unknown";
-      const score = c.score || c.cvss || c.CVSS || "";
-      html += `<li>${escapeHtml(id)} (severity: ${escapeHtml(sev)}, score: ${escapeHtml(score)})</li>`;
+      const sev = c.reported_severity || "Unknown";
+      const score = c.reported_cvss ?? "unknown";
+      html += `<li>${escapeHtml(id)} — unverified keyword candidate. Advisory severity: ${escapeHtml(sev)}; advisory CVSS: ${escapeHtml(score)} (not an asset rating). ${escapeHtml(c.applicability?.reason || "Product/version applicability requires verification.")}</li>`;
     }
     html += "</ul>";
-  } else { html += "<div>No CVEs mapped for this service.</div>"; }
+  } else { html += "<div>NVD was not queried. An empty list does not confirm the absence of vulnerabilities.</div>"; }
   const nseFindings = Array.isArray(svc.nse_findings) ? svc.nse_findings : [];
-  html += `<div class="section-title">Nmap NSE vulnerability evidence</div>`;
+  html += `<div class="section-title">Saved NSE output — interpretation unreviewed</div>`;
   if (nseFindings.length) {
     html += "<ul>";
     for (const finding of nseFindings) {
@@ -988,20 +785,115 @@ function onDetailsClick(e) {
     }
     html += "</ul>";
   } else {
-    html += "<div>No NSE vulnerability evidence reported for this service.</div>";
+    html += "<div>No saved NSE output for this service.</div>";
   }
-  html += `<div class="section-title">Remediation</div>`;
-  html += `<div id="llm-remediation" style="margin-top:6px; color:#9ca3af;">Not generated yet.</div>`;
+  html += `<div class="section-title">Review guidance</div>`;
+  html += `<details><summary>Original network evidence</summary><pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(svc.evidence || {}, null, 2))}</pre></details>`;
+  html += `<div>${escapeHtml(svc.remediation || "Confirm this service is required and restrict access to authorized clients.")}</div>`;
+  html += `<div style="margin-top:6px; color:#9ca3af;">Credential testing was not performed. This guidance does not establish a vulnerability.</div>`;
   body.innerHTML = html;
   modal.style.display = "flex";
-  if (currentScanId) loadLLMRemediation(currentScanId, svc);
 }
 
 function escapeHtml(str) {
-  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function downloadReport() {
   if (!currentScanId) { alert("Run a scan first, then download the report."); return; }
   window.location.href = `/scan/${currentScanId}/report.pdf`;
+}
+
+
+function renderLocalGraph(graph) {
+  const nodes = Object.fromEntries((graph.nodes || []).map(node => [node.id, node]));
+  const label = id => {const node = nodes[id] || {}; return node.ip || node.cve_id || `${node.service || id}${node.port ? ":" + node.port : ""}`;};
+  const positions = {}, rows = [0, 0, 0];
+  for (const node of graph.nodes || []) {
+    const column = node.type === "host" ? 0 : node.type === "service" ? 1 : 2;
+    positions[node.id] = {x: 125 + column * 310, y: 40 + rows[column]++ * 65};
+  }
+  const height = Math.max(240, Math.max(...rows) * 65 + 30);
+  const lines = (graph.edges || []).filter(edge => positions[edge.from] && positions[edge.to]).map(edge => {
+    const from = positions[edge.from], to = positions[edge.to];
+    return `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" stroke="#64748b" />`;
+  }).join("");
+  const shapes = Object.entries(positions).map(([id, point]) => `<g><rect x="${point.x - 115}" y="${point.y - 20}" width="230" height="40" rx="6" fill="#172533" stroke="#f59e0b"/><text x="${point.x}" y="${point.y + 4}" text-anchor="middle" fill="#edf2f7" font-size="12">${escapeHtml(label(id))}</text></g>`).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Saved network observations and unverified associations" width="900" height="${height}">${lines}${shapes}</svg>` + '<strong>Saved evidence associations (not proven attack paths)</strong><ul>' + (graph.edges || []).map(edge => {
+    return `<li>${escapeHtml(label(edge.from))} &rarr; ${escapeHtml(edge.relation === "runs" ? "runs" : "unverified association")} &rarr; ${escapeHtml(label(edge.to))}</li>`;
+  }).join("") + '</ul>';
+}
+
+async function renderSavedScan(scanId) {
+  const response = await fetch(`/scans/${encodeURIComponent(scanId)}/snapshot`);
+  if (!response.ok) throw new Error((await response.json()).detail || "Cannot load snapshot");
+  const snapshot = await response.json();
+  await loadFindings(scanId);
+  const components = snapshot.components;
+  if (components.network.status !== "not_run" && components.network.hosts.length) {
+    await loadScanResults(scanId);
+    if (components.network.status === "completed") await Promise.all([loadAliveHosts(scanId), loadAttackGraph(scanId)]);
+    else {
+      document.querySelector("#alive-hosts-table tbody").innerHTML = `<tr><td colspan="6">Partial network coverage: ${escapeHtml(components.network.hosts.map(host => host.ip).join(", "))}</td></tr>`;
+      document.getElementById("attack-graph-content").textContent = "Network coverage is incomplete; review the saved observations.";
+      document.getElementById("attack-graph-network").innerHTML = "";
+    }
+  } else {
+    document.querySelector("#services-table tbody").innerHTML = `<tr><td colspan="9">Network component: ${escapeHtml(components.network.status)}. No saved port observations.</td></tr>`;
+    document.querySelector("#alive-hosts-table tbody").innerHTML = '<tr><td colspan="6">No saved host observations.</td></tr>';
+    document.getElementById("attack-graph-content").textContent = "No saved network graph for this assessment.";
+    document.getElementById("attack-graph-network").innerHTML = "";
+  }
+  if (components.http.status !== "not_run") await loadWebAssessment(scanId);
+  else {
+    document.getElementById("web-assessment").textContent = "HTTP/TLS was not run for this scan.";
+    document.getElementById("web-findings").textContent = "No web component was assessed.";
+  }
+  await loadGobusterResults(scanId);
+}
+
+function populateComparisonSelectors(scans) {
+  const options = scans.map(scan => `<option value="${escapeHtml(scan.scan_id)}">${escapeHtml(scan.created_at || "Unknown time")} | ${escapeHtml(scan.target)} | ${escapeHtml(scan.profile)} | ${escapeHtml(scan.status)}</option>`).join("");
+  for (const id of ["compare-old", "compare-new"]) {
+    const element = document.getElementById(id);
+    if (!element) continue;
+    const selected = element.value;
+    element.innerHTML = '<option value="">Select saved scan</option>' + options;
+    if (scans.some(scan => scan.scan_id === selected)) element.value = selected;
+  }
+  const old = document.getElementById("compare-old"), current = document.getElementById("compare-new");
+  if (current && !current.value && scans.length) current.value = scans[0].scan_id;
+  if (old && !old.value && scans.length > 1) old.value = scans[1].scan_id;
+}
+
+async function compareSelectedScans() {
+  const output = document.getElementById("comparison-results");
+  const oldId = document.getElementById("compare-old").value;
+  const newId = document.getElementById("compare-new").value;
+  if (!oldId || !newId) {output.textContent = "Select baseline and current scans."; return;}
+  output.textContent = "Comparing saved evidence...";
+  try {
+    const response = await fetch(`/scans/${encodeURIComponent(newId)}/compare/${encodeURIComponent(oldId)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Comparison failed");
+    output.innerHTML = renderComparison(data);
+  } catch (error) {output.textContent = "Comparison unavailable: " + error.message;}
+}
+
+function renderComparison(data) {
+  let html = '<p>Observation changes only. Missing or incomplete coverage never confirms a fix.</p>';
+  for (const category of ["added", "removed", "changed", "uncertain"]) {
+    const entries = data[category] || [];
+    html += `<h3>${escapeHtml(category)} (${entries.length})</h3>`;
+    html += entries.length ? '<table><thead><tr><th>Component / observation</th><th>Before</th><th>After</th><th>Evidence limits</th></tr></thead><tbody>' + entries.map(entry => `<tr><td>${escapeHtml(entry.component)} / ${escapeHtml(entry.kind)}<br>${escapeHtml(entry.key)}</td><td><pre>${escapeHtml(JSON.stringify(entry.before, null, 2))}</pre></td><td><pre>${escapeHtml(JSON.stringify(entry.after, null, 2))}</pre></td><td>${escapeHtml(entry.reason)}</td></tr>`).join("") + '</tbody></table>' : '<p>No entries in this category.</p>';
+  }
+  if (!["added", "removed", "changed"].some(key => (data[key] || []).length)) html += '<p>No comparable exposure changes observed. Review uncertain coverage above.</p>';
+  return html;
+}
+
+function exportComparison(format) {
+  const oldId = document.getElementById("compare-old").value;
+  const newId = document.getElementById("compare-new").value;
+  if (!oldId || !newId) return;
+  window.location.href = `/scan/${encodeURIComponent(newId)}/${format === "pdf" ? "report.pdf" : "findings.csv"}?baseline=${encodeURIComponent(oldId)}`;
 }

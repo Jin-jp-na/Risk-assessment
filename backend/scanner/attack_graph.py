@@ -72,8 +72,9 @@ def build_attack_graph(parsed_scan: Dict[str, Any]) -> Dict[str, Any]:
                     "cve_id": cve_value,
                     "severity": c.get("severity"),
                     "cvss": c.get("cvss") or c.get("score"),
+                    "verification_status": "unverified",
                 })
-                add_edge({"from": sid, "to": cid, "relation": "has_vulnerability"})
+                add_edge({"from": sid, "to": cid, "relation": "candidate_cve"})
 
     high_services: List[Tuple[Dict[str, Any], Dict[str, Any]]] = [
         (host, svc) for host in hosts

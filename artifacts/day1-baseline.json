@@ -1,0 +1,40 @@
+﻿{
+    "verified_at":  "2026-11-16T23:45:44.9985594Z",
+    "environment":  ".venv-baseline",
+    "python_version":  "3.14.3",
+    "launch_command":  "python.exe -B -m uvicorn backend.main:app --host 127.0.0.1 --port 8787",
+    "startup":  "Application startup complete; Uvicorn running on http://127.0.0.1:8787",
+    "pip_check":  "No broken requirements found.",
+    "tool_files":  {
+                       "nmap":  true,
+                       "angry_ip":  false,
+                       "gobuster":  true,
+                       "wordlist":  true
+                   },
+    "http_checks":  [
+                        {
+                            "path":  "/health",
+                            "status_code":  200,
+                            "body":  {
+                                         "status":  "ok",
+                                         "service":  "risklens-backend",
+                                         "boot_id":  "cf0baff7-2f65-4e4f-aa19-2300b7fae85a"
+                                     }
+                        },
+                        {
+                            "path":  "/",
+                            "status_code":  200
+                        },
+                        {
+                            "path":  "/static/app.js?v=18",
+                            "status_code":  200
+                        }
+                    ],
+    "application_source_hashes_unchanged":  true,
+    "source_files_checked":  12,
+    "socket_inventory":  "Get-NetTCPConnection denied; bind evidenced by launch command and server log",
+    "scans_executed":  false,
+    "browser_javascript_executed":  false,
+    "fresh_venv_install_executed":  false,
+    "scanner_and_export_runtime_verified":  false
+}

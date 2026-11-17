@@ -1,0 +1,8 @@
+{
+  "url": "http://192.168.1.10",
+  "http": {},
+  "tls": {},
+  "technologies": [],
+  "checks": [],
+  "error": "HTTPConnectionPool(host='192.168.1.10', port=80): Max retries exceeded with url: / (Caused by ConnectTimeoutError(<HTTPConnection(host='192.168.1.10', port=80) at 0x271ab5d2a50>, 'Connection to 192.168.1.10 timed out. (connect timeout=15)'))"
+}

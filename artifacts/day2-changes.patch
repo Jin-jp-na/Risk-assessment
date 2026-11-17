@@ -1,0 +1,1145 @@
+diff --git a/README.md b/README.md
+index 70bc0c1..3f6f5a1 100644
+--- a/README.md
++++ b/README.md
+@@ -2,10 +2,14 @@
+ 
+ RiskLens is a Windows web application that runs Nmap service discovery and
+ vulnerability NSE scripts,
+-enriches services with NVD vulnerability data, calculates a contextual risk
+-score, checks selected weak credentials, builds an attack graph, and optionally
++calculates a contextual risk score from saved observations, builds an attack graph, and optionally
+ performs web directory discovery with Gobuster.
+ 
++Opening results, history, CSV, or PDF reads saved evidence without credential
++attempts, live NVD lookups, or reverse-DNS requests. Service details contain
++small deterministic review messages. Credential testing is disabled; "not tested"
++does not mean credentials are safe. NVD "not queried" does not mean no CVEs exist.
++
+ Only scan systems that you own or have explicit permission to assess.
+ 
+ ## Requirements
+@@ -15,8 +19,7 @@ Only scan systems that you own or have explicit permission to assess.
+ - Nmap for Windows
+ - Angry IP Scanner, required only for CIDR/subnet scans
+ - A modern browser
+-- Internet access for NVD lookups, the CDN-loaded frontend libraries, and
+-  optional Gemini remediation
++- Internet access for the existing CDN-loaded frontend libraries
+ 
+ The repository contains a Windows Gobuster executable at
+ `gobuster_Windows_x86_64\gobuster.exe` and its wordlist at
+@@ -27,7 +30,7 @@ The repository contains a Windows Gobuster executable at
+ Open PowerShell and run these commands from the project directory:
+ 
+ ```powershell
+-cd F:\kale\PCVP
++Set-Location 'D:\security project'
+ 
+ # Create a fresh environment. Do not use the checked-in venv; it belongs to
+ # the computer on which the project was originally developed.
+@@ -79,28 +82,16 @@ Test-Path '.\wordlists\common.txt'
+ 
+ The first two commands should return `True`.
+ 
+-## Optional API keys
+-
+-The application works without these keys, but some features are reduced:
+-
+-- `NVD_API_KEY` increases the NVD API request allowance.
+-- `GEMINI_API_KEY` enables LLM-generated remediation in the service details
+-  dialog. Without it, the UI displays an explanatory fallback.
+-
+-Set keys only in the current PowerShell session:
+-
+-```powershell
+-$env:NVD_API_KEY = 'your-nvd-key'
+-$env:GEMINI_API_KEY = 'your-gemini-key'
+-```
++## Local result viewing
+ 
+-Do not commit keys to the repository. To make them persistent, configure them
+-through Windows environment-variable settings instead of placing them in
+-source code.
++No API key is required. Result and report handlers do not call external enrichment
++services. The legacy credential-checking implementation is retained as unused
++source, is not imported by the application, and its optional Paramiko dependency
++is no longer installed by the application requirements.
+ 
+ ## Start the application
+ 
+-From `F:\kale\PCVP`, with the virtual environment active:
++From the project root, with the virtual environment active:
+ 
+ ```powershell
+ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8787 --reload
+@@ -139,7 +130,7 @@ The response should include `"status": "ok"`.
+ 4. Wait for Nmap, its `vuln` NSE checks, and (for web targets) Gobuster to
+    complete. NSE checks can take longer than a basic port scan.
+ 5. Review **Overview**, **Services**, **Attack Graph**, and **Web Scan**.
+-6. Open **Details** for remediation and use **Download PDF** when the scan is
++6. Open **Details** for local review guidance and use **Download PDF** when the scan is
+    complete.
+ 
+ For a specific port, enter it as part of the target, such as
+@@ -157,7 +148,7 @@ Only scan systems for which you have explicit authorization because some NSE
+ checks can be intrusive and may generate more traffic than service discovery.
+ 
+ The Overview tab also provides an asset inventory with IP addresses, hostnames,
+-reverse-DNS names, MAC/vendor data when available, OS matches, services, and
++hostnames saved by Nmap, MAC/vendor data when available, OS matches, services, and
+ ports. The Web Scan tab adds HTTP status/header checks, security-header
+ coverage, technology hints, TLS protocol/cipher information, and certificate
+ metadata when the target uses HTTPS.
+@@ -211,12 +202,22 @@ different, update the two constants in `backend\main.py` and restart Uvicorn.
+ The checked-in `venv` records an absolute Python path from another computer.
+ Ignore or remove that environment and use the fresh `.venv` created above.
+ 
+-### No CVE results
++### Empty CVE results
++
++The compatibility `/scan/{scan_id}/nvd` endpoint is retained for the existing UI,
++but returns `status: not_queried` with no live NVD request. Existing raw XML does
++not contain previous NVD keyword-enrichment results. No result-viewing operation
++attempts credentials or contacts saved targets.
+ 
+-NVD lookups require internet access and work best when Nmap identifies a
+-product and version. Set `NVD_API_KEY` if the public NVD rate limit is reached.
++## Regression tests
+ 
+-### Remediation says `GEMINI_API_KEY not set`
++```powershell
++Set-Location 'D:\security project'
++& '.\.venv\Scripts\python.exe' -m pip install -r requirements-dev.txt
++& '.\.venv\Scripts\python.exe' -B -m unittest discover -s tests -v
++```
+ 
+-Set `GEMINI_API_KEY` in the same PowerShell window before starting Uvicorn,
+-then restart the server.
++The suite uses synthetic saved evidence and in-process HTTP requests. It blocks
++outbound requests, DNS, socket connections, subprocesses, and credential annotation
++while reading every GET route, including CSV/PDF. Scanner submission is tested
++with mocked workers, not a real target scan.
+diff --git a/backend/llm_remediation.py b/backend/llm_remediation.py
+deleted file mode 100644
+index 769fd66..0000000
+--- a/backend/llm_remediation.py
++++ /dev/null
+@@ -1,144 +0,0 @@
+-from __future__ import annotations
+-
+-from typing import Any, Dict, List
+-import json
+-import os
+-import hashlib
+-import time
+-
+-from google import genai
+-
+-CACHE_FILE = "llm_cache.json"
+-LAST_CALL_TS = 0
+-
+-
+-def _load_cache() -> Dict[str, Any]:
+-    if not os.path.exists(CACHE_FILE):
+-        return {}
+-    try:
+-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+-            return json.load(f)
+-    except Exception:
+-        return {}
+-
+-
+-def _save_cache(cache: Dict[str, Any]) -> None:
+-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+-        json.dump(cache, f)
+-
+-
+-def _cache_key(svc: Dict[str, Any], exposure: str) -> str:
+-    raw = json.dumps(
+-        {
+-            "ip": svc.get("ip"),
+-            "port": svc.get("port"),
+-            "proto": svc.get("protocol"),
+-            "service": svc.get("service"),
+-            "product": svc.get("product"),
+-            "version": svc.get("version"),
+-            "exposure": exposure,
+-        },
+-        sort_keys=True,
+-    )
+-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+-
+-
+-def _rate_limit(seconds: int = 5) -> None:
+-    global LAST_CALL_TS
+-    now = time.time()
+-    if now - LAST_CALL_TS < seconds:
+-        raise Exception("LLM rate limit: wait a few seconds")
+-    LAST_CALL_TS = now
+-
+-
+-def _extract_cves(svc: Dict[str, Any]) -> List[Dict[str, Any]]:
+-    """
+-    Your svc["nvd"] structure depends on enrich_service_with_nvd().
+-    This function tries multiple shapes safely.
+-    """
+-    nvd = svc.get("nvd") or {}
+-    for key in ("cves", "items", "results", "vulns"):
+-        if isinstance(nvd.get(key), list):
+-            return nvd[key]
+-    if isinstance(svc.get("mapped_cves"), list):
+-        return svc["mapped_cves"]
+-    return []
+-
+-
+-def build_prompt(svc: Dict[str, Any], exposure: str) -> str:
+-    cves = _extract_cves(svc)[:3]  # even smaller
+-    cve_lines = []
+-    for c in cves:
+-        cve_id = c.get("cve_id") or c.get("id") or c.get("cve") or "UNKNOWN"
+-        sev = c.get("severity") or "UNK"
+-        score = c.get("score") or c.get("cvss") or c.get("cvss_score") or ""
+-        cve_lines.append(f"{cve_id}|{sev}|{score}")
+-
+-    weak = svc.get("weak_creds") or {}
+-    weak_line = "none"
+-    if isinstance(weak, dict) and weak.get("found"):
+-        weak_line = f"{weak.get('protocol','?')} {weak.get('username','?')}:{weak.get('password','?')}"
+-
+-    return (
+-        "RETURN JSON ONLY. MAX 3 steps, MAX 1 verification.\n"
+-        "No extra keys. No markdown. Only this service.\n"
+-        f"exposure={exposure}; ip={svc.get('ip')}; port={svc.get('port')}/{svc.get('protocol')}; "
+-        f"svc={svc.get('service')}; product={svc.get('product')}; version={svc.get('version')}; "
+-        f"pcvp={svc.get('pcvp_score')} {svc.get('pcvp_level')}; weak={weak_line}; "
+-        f"cves={';'.join(cve_lines) if cve_lines else 'none'}\n"
+-        'OUTPUT: {"summary":"","priority":"critical|high|medium|low|info","steps":[""],"verification":[""],"references":[""]}'
+-    )
+-
+-
+-def generate_remediation_openai(
+-    svc: Dict[str, Any], exposure: str, model: str = "gemini-2.5-flash-lite"
+-) -> Dict[str, Any]:
+-    api_key = os.environ.get("GEMINI_API_KEY")
+-    if not api_key:
+-        return {
+-            "summary": "GEMINI_API_KEY not set.",
+-            "priority": "info",
+-            "steps": ["Set GEMINI_API_KEY environment variable and restart the server."],
+-            "verification": [],
+-            "references": [],
+-        }
+-
+-    client = genai.Client(api_key=api_key)
+-    prompt = build_prompt(svc, exposure)
+-
+-    # Cache check
+-    cache = _load_cache()
+-    key = _cache_key(svc, exposure)
+-    if key in cache:
+-        return cache[key]
+-
+-    # Rate limit
+-    _rate_limit(5)
+-
+-    resp = client.models.generate_content(
+-        model=model,
+-        contents=prompt,
+-        config={
+-            "temperature": 0.1,
+-            "max_output_tokens": 200,
+-            "response_mime_type": "application/json",
+-        },
+-    )
+-
+-    text = (resp.text or "").strip()
+-
+-    try:
+-        result = json.loads(text)
+-    except Exception:
+-        result = {
+-            "summary": "LLM output was not valid JSON (fallback).",
+-            "priority": "info",
+-            "steps": [],
+-            "verification": [],
+-            "references": [],
+-            "raw": text,
+-        }
+-
+-    cache[key] = result
+-    _save_cache(cache)
+-    return result
+\ No newline at end of file
+diff --git a/backend/main.py b/backend/main.py
+index b3ed4f7..16c01a7 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1,8 +1,5 @@
+ import csv
+-import logging
+ from contextlib import asynccontextmanager
+-logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+-logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
+ from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+ from fastapi.templating import Jinja2Templates
+ from fastapi.staticfiles import StaticFiles
+@@ -17,12 +14,9 @@ import ssl
+ import requests
+ from urllib.parse import urlparse
+ from pathlib import Path
+-from backend.scanner.nvd_mapping import enrich_service_with_nvd
+ from pydantic import BaseModel
+ from backend.scanner.pcvp_scoring import pcvp_score_for_service
+ from backend.scanner.attack_graph import build_attack_graph
+-from backend.scanner.weak_creds import annotate_services_with_weak_creds
+-from backend.llm_remediation import generate_remediation_openai
+ from starlette.responses import StreamingResponse, Response
+ from backend.report_generator import build_pdf_report
+ from io import BytesIO
+@@ -120,13 +114,6 @@ class WebScanStatus(BaseModel):
+     status: str
+     message: str
+ 
+-class RemediationRequest(BaseModel):
+-    scan_id: str
+-    ip: str
+-    port: int
+-    protocol: str = "tcp"
+-
+-
+ scan_status_store: dict[str, ScanStatus] = {}
+ 
+ 
+@@ -750,16 +737,12 @@ def parse_nmap_xml(xml_path: Path) -> dict:
+                 mac_address = addr.get("@addr")
+                 mac_vendor = addr.get("@vendor")
+ 
+-        reverse_dns = None
+-        if ip:
+-            try:
+-                reverse_dns = socket.gethostbyaddr(ip)[0]
+-            except (socket.herror, socket.gaierror, OSError):
+-                reverse_dns = None
+-
+         hostnames_block = (host.get("hostnames") or {}).get("hostname", [])
+         if isinstance(hostnames_block, dict):
+             hostnames_block = [hostnames_block]
++        # Replaying saved XML must not initiate a fresh DNS lookup.
++        reverse_dns = next((item.get("@name") for item in hostnames_block
++                            if item.get("@type") == "PTR"), None)
+         hostnames = [
+             item.get("@name")
+             for item in hostnames_block
+@@ -876,31 +859,7 @@ def get_scan_with_nvd(scan_id: str):
+         else infer_exposure_from_target(scan_status.target)
+     )
+ 
+-    annotate_services_with_weak_creds(parsed)
+-
+-    host_count = 0
+-    for host in parsed.get("hosts", []):
+-        host_count += 1
+-        svc_count = 0
+-        for svc in host.get("services", []):
+-            svc_count += 1
+-            product = svc.get("product")
+-            version = svc.get("version")
+-
+-            try:
+-                svc["nvd"] = enrich_service_with_nvd(product, version)
+-            except Exception as nvd_err:
+-                svc["nvd"] = {"keyword": None, "cves": [], "error": str(nvd_err)}
+-
+-            try:
+-                pcvp = pcvp_score_for_service(svc, exposure_effective)
+-                svc["pcvp_score"] = pcvp["pcvp_score"]
+-                svc["pcvp_level"] = pcvp["pcvp_level"]
+-                svc["pcvp_reasons"] = pcvp["pcvp_reasons"]
+-            except Exception:
+-                svc["pcvp_score"] = 0
+-                svc["pcvp_level"] = "informational"
+-                svc["pcvp_reasons"] = []
++    annotate_saved_services(parsed, exposure_effective)
+ 
+     return {"scan_id": scan_id, "exposure": scan_status.exposure, "profile": scan_status.profile, "data": parsed}
+ 
+@@ -964,18 +923,38 @@ def build_findings(parsed: dict, web_assessment: Optional[dict] = None) -> list[
+     return sorted(findings, key=lambda item: (rank.get(item["severity"], 0), float(item.get("cvss") or 0)), reverse=True)
+ 
+ 
++def service_remediation(service: dict) -> str:
++    """Local review guidance, not a claim that this service is vulnerable."""
++    name = (service.get("service") or "").lower()
++    port = service.get("port")
++    if name == "ftp" or port == 21:
++        return "If file transfer is required, prefer an encrypted protocol and restrict access to authorized clients."
++    if name == "ssh" or port == 22:
++        return "Restrict SSH to authorized clients, prefer key-based authentication, and review vendor updates."
++    if name in {"http", "https"} or port in {80, 443, 8080, 8443}:
++        return "Review the saved HTTP/TLS evidence, enable HTTPS where appropriate, and restrict administrative paths."
++    return "Confirm this service is required, restrict access to authorized clients, and review vendor updates."
++
++
++def annotate_saved_services(parsed: dict, exposure: str) -> None:
++    """Keep the existing service response shape without performing external I/O."""
++    for host in parsed.get("hosts", []):
++        for service in host.get("services", []):
++            service["ip"] = host.get("ip")
++            # XML contains no credential test or NVD lookup results. Not tested
++            # is deliberately distinct from a successful negative check.
++            service["weak_creds"] = {"found": False, "status": "not_tested"}
++            service["nvd"] = {"keyword": None, "cves": [], "status": "not_queried"}
++            service["remediation"] = service_remediation(service)
++            service.update(pcvp_score_for_service(service, exposure))
++
++
+ def enrich_scan_data(scan_id: str) -> tuple[dict, Optional[dict]]:
+     xml_path = SCANS_DIR / f"{scan_id}.xml"
+     parsed = parse_nmap_xml(xml_path)
+     status = scan_status_store.get(scan_id)
+     exposure = status.exposure_effective if status and status.exposure_effective else "external"
+-    annotate_services_with_weak_creds(parsed)
+-    for host in parsed.get("hosts", []):
+-        for service in host.get("services", []):
+-            service["ip"] = host.get("ip")
+-            service["nvd"] = enrich_service_with_nvd(service.get("product"), service.get("version"))
+-            score = pcvp_score_for_service(service, exposure)
+-            service.update(score)
++    annotate_saved_services(parsed, exposure)
+     audit_path = SCANS_DIR / f"web_audit_{scan_id}.json"
+     web_audit = json.loads(audit_path.read_text(encoding="utf-8")) if audit_path.exists() else None
+     return parsed, web_audit
+@@ -1027,16 +1006,7 @@ def get_attack_graph(scan_id: str):
+         else infer_exposure_from_target(scan_status.target)
+     )
+ 
+-    for host in parsed.get("hosts", []):
+-        for svc in host.get("services", []):
+-            product = svc.get("product")
+-            version = svc.get("version")
+-            svc["nvd"] = enrich_service_with_nvd(product, version)
+-
+-            pcvp = pcvp_score_for_service(svc, exposure_effective)
+-            svc["pcvp_score"] = pcvp["pcvp_score"]
+-            svc["pcvp_level"] = pcvp["pcvp_level"]
+-            svc["pcvp_reasons"] = pcvp["pcvp_reasons"]
++    annotate_saved_services(parsed, exposure_effective)
+ 
+     graph = build_attack_graph(parsed)
+     return {"scan_id": scan_id, "exposure": scan_status.exposure, "graph": graph}
+@@ -1273,52 +1243,6 @@ def get_alive_hosts(scan_id: str):
+             })
+     return {"scan_id": scan_id, "hosts": hosts}
+ 
+-@app.post("/scan/{scan_id}/remediation")
+-def get_llm_remediation(scan_id: str, req: RemediationRequest):
+-    xml_path = SCANS_DIR / f"{scan_id}.xml"
+-    if not xml_path.exists():
+-        raise HTTPException(status_code=404, detail="Scan output not found yet")
+-
+-    parsed = parse_nmap_xml(xml_path)
+-
+-    scan_status = scan_status_store.get(scan_id)
+-
+-    exposure_effective = (
+-        scan_status.exposure_effective
+-        if scan_status and scan_status.exposure_effective
+-        else infer_exposure_from_target(scan_status.target) if scan_status else "external"
+-    )
+-
+-    annotate_services_with_weak_creds(parsed)
+-
+-    target_svc = None
+-    for host in parsed.get("hosts", []):
+-        if host.get("ip") != req.ip:
+-            continue
+-        for svc in host.get("services", []):
+-            if svc.get("port") == req.port and (svc.get("protocol") or "tcp") == req.protocol:
+-                svc["ip"] = host.get("ip")
+-
+-                svc["nvd"] = enrich_service_with_nvd(svc.get("product"), svc.get("version"))
+-                pcvp = pcvp_score_for_service(svc, exposure_effective)
+-                svc["pcvp_score"] = pcvp["pcvp_score"]
+-                svc["pcvp_level"] = pcvp["pcvp_level"]
+-                svc["pcvp_reasons"] = pcvp["pcvp_reasons"]
+-
+-                target_svc = svc
+-                break
+-
+-    if not target_svc:
+-        raise HTTPException(status_code=404, detail="Service not found for remediation generation")
+-
+-    remediation = generate_remediation_openai(target_svc, exposure_effective)
+-    return {
+-        "scan_id": scan_id,
+-        "exposure": scan_status.exposure if scan_status else "auto",
+-        "service": target_svc,
+-        "remediation": remediation,
+-    }
+-
+ @app.get("/scan/{scan_id}/report.pdf")
+ def download_report(scan_id: str):
+     xml_path = SCANS_DIR / f"{scan_id}.xml"
+@@ -1335,16 +1259,7 @@ def download_report(scan_id: str):
+         else infer_exposure_from_target(scan_status.target) if scan_status else "external"
+     )
+ 
+-    annotate_services_with_weak_creds(parsed)
+-
+-    for host in parsed.get("hosts", []):
+-        for svc in host.get("services", []):
+-            svc["ip"] = host.get("ip")
+-            svc["nvd"] = enrich_service_with_nvd(svc.get("product"), svc.get("version"))
+-            pcvp = pcvp_score_for_service(svc, exposure_effective)
+-            svc["pcvp_score"] = pcvp["pcvp_score"]
+-            svc["pcvp_level"] = pcvp["pcvp_level"]
+-            svc["pcvp_reasons"] = pcvp["pcvp_reasons"]
++    annotate_saved_services(parsed, exposure_effective)
+ 
+     attack_graph = build_attack_graph(parsed)
+     findings = build_findings(parsed)
+@@ -1361,4 +1276,4 @@ def download_report(scan_id: str):
+         BytesIO(pdf_bytes),
+         media_type="application/pdf",
+         headers={"Content-Disposition": f'attachment; filename="pcvp_report_{scan_id}.pdf"'},
+-    )
+\ No newline at end of file
++    )
+diff --git a/backend/report_generator.py b/backend/report_generator.py
+index e79971c..0788089 100644
+--- a/backend/report_generator.py
++++ b/backend/report_generator.py
+@@ -76,7 +76,6 @@ def build_pdf_report(
+ 
+     critical = sum(1 for s in services_flat if (s.get("pcvp_level") == "critical"))
+     high = sum(1 for s in services_flat if (s.get("pcvp_level") == "high"))
+-    weak = sum(1 for s in services_flat if (s.get("weak_creds") or {}).get("found"))
+ 
+     # Executive summary
+     story.append(Paragraph("Executive Summary", h2))
+@@ -85,7 +84,7 @@ def build_pdf_report(
+             ["Hosts discovered", str(len(hosts))],
+             ["Services detected", str(len(services_flat))],
+             ["Critical / High services", f"{critical} / {high}"],
+-            ["Weak credentials findings", str(weak)],
++            ["Credential testing", "Not performed"],
+         ],
+         colWidths=[8 * cm, 6 * cm],
+     )
+@@ -162,7 +161,7 @@ def build_pdf_report(
+         weak_text = (
+             f"{_safe(wc.get('protocol'))} {_safe(wc.get('username'))}:{_safe(wc.get('password'))}"
+             if wc.get("found")
+-            else "None"
++            else "Not tested"
+         )
+ 
+         nvd = s.get("nvd") or {}
+@@ -170,7 +169,7 @@ def build_pdf_report(
+         if isinstance(cves, list) and cves:
+             cve_text = ", ".join([_safe(cv.get("cve_id") or cv.get("id")) for cv in cves[:3]])
+         else:
+-            cve_text = "None"
++            cve_text = "Not queried"
+ 
+         data.append(
+             [
+@@ -223,4 +222,4 @@ def build_pdf_report(
+         story.append(findings_table)
+ 
+     doc.build(story, onFirstPage=_page_footer, onLaterPages=_page_footer)
+-    return buf.getvalue()
+\ No newline at end of file
++    return buf.getvalue()
+diff --git a/frontend/static/app.js b/frontend/static/app.js
+index c19c71f..35de886 100644
+--- a/frontend/static/app.js
++++ b/frontend/static/app.js
+@@ -254,12 +254,6 @@ if (cachedGraph) {
+     localStorage.removeItem("pcvp:lastGobusterHtml");
+     localStorage.removeItem("pcvp:lastGraphText");
+ 
+-    // ✅ Clear remediation cache for old scan
+-    for (const key of Object.keys(localStorage)) {
+-      if (key.startsWith("pcvp:remediation:")) {
+-        localStorage.removeItem(key);
+-      }
+-    }
+     const target = document.getElementById("target").value.trim();
+     const exposure = document.getElementById("exposure").value;
+     const profile = document.getElementById("profile").value;
+@@ -557,7 +551,7 @@ function pollScanStatus(scanId) {
+ 
+ async function loadScanResults(scanId) {
+   const servicesBody = document.querySelector("#services-table tbody");
+-  servicesBody.innerHTML = `<tr><td colspan="9">Loading NVD/RiskLens data...</td></tr>`;
++  servicesBody.innerHTML = `<tr><td colspan="9">Loading saved RiskLens data...</td></tr>`;
+   currentServices = [];
+ 
+   try {
+@@ -622,7 +616,7 @@ for (const svc of rows) {
+     level === "low" ? "badge-low" : "badge-info";
+   const weakCredsText = svc.weak_creds && svc.weak_creds.found
+     ? `${svc.weak_creds.protocol || ""} ${svc.weak_creds.username}:${svc.weak_creds.password}`
+-    : "None";
++    : "Not tested";
+   const weakPillClass = svc.weak_creds && svc.weak_creds.found ? "pill pill-weak" : "pill";
+   const nseCount = Array.isArray(svc.nse_findings) ? svc.nse_findings.length : 0;
+   tr.innerHTML = `
+@@ -896,52 +890,6 @@ localStorage.setItem("pcvp:lastGraphText", textContainer.innerHTML || textContai
+   }
+ }
+ 
+-async function loadLLMRemediation(scanId, svc) {
+-  const el = document.getElementById("llm-remediation");
+-  if (!el) return;
+-
+-  // ✅ Check cache first
+-  const cacheKey = `pcvp:remediation:${scanId}:${svc.ip}:${svc.port}:${svc.protocol || "tcp"}`;
+-  const cached = localStorage.getItem(cacheKey);
+-  if (cached) {
+-    el.innerHTML = cached;
+-    return;
+-  }
+-
+-  el.innerHTML = `<div style="color:#9ca3af;">Generating remediation...</div>`;
+-
+-  try {
+-    const resp = await fetch(`/scan/${scanId}/remediation`, {
+-      method: "POST",
+-      headers: { "Content-Type": "application/json" },
+-      body: JSON.stringify({ scan_id: scanId, ip: svc.ip, port: svc.port, protocol: svc.protocol || "tcp" }),
+-    });
+-    const data = await resp.json();
+-    if (!resp.ok) {
+-      el.innerHTML = `<div style="color:#fca5a5;">Failed: ${escapeHtml(data.detail || `HTTP ${resp.status}`)}</div>`;
+-      return;
+-    }
+-    const r = data.remediation || {};
+-    const steps = Array.isArray(r.steps) ? r.steps : [];
+-    const verification = Array.isArray(r.verification) ? r.verification : [];
+-    const refs = Array.isArray(r.references) ? r.references : [];
+-
+-    const html = `
+-      <div><strong>Summary:</strong> ${escapeHtml(r.summary || "")}</div>
+-      <div><strong>Priority:</strong> ${escapeHtml(r.priority || "")}</div>
+-      ${steps.length ? `<div class="section-title">Recommended Steps</div><ul>${steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>` : `<div style="color:#9ca3af; margin-top:6px;">No steps returned.</div>`}
+-      ${verification.length ? `<div class="section-title">Verification</div><ul>${verification.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>` : ""}
+-      ${refs.length ? `<div class="section-title">References</div><ul>${refs.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ul>` : ""}
+-    `;
+-
+-    el.innerHTML = html;
+-    // ✅ Save to cache
+-    localStorage.setItem(cacheKey, html);
+-  } catch (err) {
+-    console.error(err);
+-    el.innerHTML = `<div style="color:#fca5a5;">Error generating remediation (see console).</div>`;
+-  }
+-}
+ function onDetailsClick(e) {
+   const ip = e.target.getAttribute("data-ip");
+   const port = parseInt(e.target.getAttribute("data-port"), 10);
+@@ -978,7 +926,7 @@ function onDetailsClick(e) {
+       html += `<li>${escapeHtml(id)} (severity: ${escapeHtml(sev)}, score: ${escapeHtml(score)})</li>`;
+     }
+     html += "</ul>";
+-  } else { html += "<div>No CVEs mapped for this service.</div>"; }
++  } else { html += "<div>NVD was not queried. An empty list does not confirm the absence of vulnerabilities.</div>"; }
+   const nseFindings = Array.isArray(svc.nse_findings) ? svc.nse_findings : [];
+   html += `<div class="section-title">Nmap NSE vulnerability evidence</div>`;
+   if (nseFindings.length) {
+@@ -990,11 +938,11 @@ function onDetailsClick(e) {
+   } else {
+     html += "<div>No NSE vulnerability evidence reported for this service.</div>";
+   }
+-  html += `<div class="section-title">Remediation</div>`;
+-  html += `<div id="llm-remediation" style="margin-top:6px; color:#9ca3af;">Not generated yet.</div>`;
++  html += `<div class="section-title">Review guidance</div>`;
++  html += `<div>${escapeHtml(svc.remediation || "Confirm this service is required and restrict access to authorized clients.")}</div>`;
++  html += `<div style="margin-top:6px; color:#9ca3af;">Credential testing was not performed. This guidance does not establish a vulnerability.</div>`;
+   body.innerHTML = html;
+   modal.style.display = "flex";
+-  if (currentScanId) loadLLMRemediation(currentScanId, svc);
+ }
+ 
+ function escapeHtml(str) {
+@@ -1004,4 +952,4 @@ function escapeHtml(str) {
+ function downloadReport() {
+   if (!currentScanId) { alert("Run a scan first, then download the report."); return; }
+   window.location.href = `/scan/${currentScanId}/report.pdf`;
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/templates/index.html b/frontend/templates/index.html
+index 1f63de4..8521db2 100644
+--- a/frontend/templates/index.html
++++ b/frontend/templates/index.html
+@@ -206,7 +206,7 @@
+           <div class="text-3xl font-extrabold mt-2" id="stat-critical">0 / 0</div>
+         </div>
+         <div class="glass border border-slate-800 rounded-2xl p-4">
+-          <div class="text-xs text-slate-400">Weak Cred Findings</div>
++          <div class="text-xs text-slate-400">Credential testing disabled</div>
+           <div class="text-3xl font-extrabold mt-2" id="stat-weak-creds">0</div>
+         </div>
+       </div>
+@@ -269,7 +269,7 @@
+       <div class="flex items-center justify-between gap-3">
+         <div>
+           <div class="text-lg font-bold">Prioritized findings</div>
+-          <div class="text-sm text-slate-400">Evidence-backed issues from Nmap, NVD, credential checks, and web checks.</div>
++          <div class="text-sm text-slate-400">Saved Nmap and web evidence. Credential testing and live NVD lookups are disabled.</div>
+         </div>
+         <button id="download-findings-btn" type="button" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Download CSV</button>
+       </div>
+@@ -356,7 +356,7 @@
+     </div>
+   </div>
+ 
+-  <script src="/static/app.js?v=18"></script>
++  <script src="/static/app.js?v=19"></script>
+ 
+   <script>
+     const tabBtns = document.querySelectorAll(".tab-btn");
+@@ -375,4 +375,4 @@
+     showTab("tab-overview");
+   </script>
+ </body>
+-</html>
+\ No newline at end of file
++</html>
+diff --git a/requirements.txt b/requirements.txt
+index 218c883..db85d7a 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -18,7 +18,5 @@ typing-inspection==0.4.2
+ typing_extensions==4.15.0
+ uvicorn==0.38.0
+ xmltodict==1.0.2
+-google-genai==1.64.0
+-paramiko==4.0.0
+ requests==2.32.5
+ reportlab==4.4.7
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1,2 @@
++-r requirements.txt
++httpx==0.28.1
+diff --git a/tests/test_read_only_endpoints.py b/tests/test_read_only_endpoints.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_read_only_endpoints.py
+@@ -0,0 +1,195 @@
++"""Exercise real ASGI routes against synthetic saved files, never real targets."""
++
++from contextlib import ExitStack
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import types
++import unittest
++from unittest.mock import Mock, patch
++
++from fastapi.testclient import TestClient
++
++
++# A tripwire works even when Paramiko/GenAI are absent from a clean environment.
++# If the application imports the old annotation helper, it receives this mock.
++credential_module = types.ModuleType("backend.scanner.weak_creds")
++credential_attempt = Mock(side_effect=AssertionError("Credential attempt during a read"))
++credential_module.annotate_services_with_weak_creds = credential_attempt
++previous_credential_module = sys.modules.get("backend.scanner.weak_creds")
++sys.modules["backend.scanner.weak_creds"] = credential_module
++try:
++    from backend import main
++finally:
++    if previous_credential_module is None:
++        sys.modules.pop("backend.scanner.weak_creds", None)
++    else:
++        sys.modules["backend.scanner.weak_creds"] = previous_credential_module
++
++
++SCAN_ID = "11111111-1111-4111-8111-111111111111"
++XML = """<?xml version="1.0"?>
++<nmaprun><host><status state="up"/>
++<address addr="192.0.2.10" addrtype="ipv4"/>
++<hostnames><hostname name="saved.example.test" type="PTR"/></hostnames>
++<ports>
++<port protocol="tcp" portid="21"><state state="open"/><service name="ftp" product="Synthetic FTP" version="1.0"/></port>
++<port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="Synthetic SSH" version="1.0"/></port>
++<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="Synthetic HTTP" version="1.0"/></port>
++</ports></host></nmaprun>"""
++
++
++class ReadOnlyEndpointsTest(unittest.TestCase):
++    def setUp(self):
++        self.stack = ExitStack()
++        self.addCleanup(self.stack.close)
++        directory = Path(self.stack.enter_context(tempfile.TemporaryDirectory(
++            prefix=".risklens-test-", dir=Path(__file__).resolve().parents[1]
++        )))
++        self.directory = directory
++        (directory / f"{SCAN_ID}.xml").write_text(XML, encoding="utf-8")
++        (directory / f"gobuster_{SCAN_ID}.txt").write_text(
++            "/docs (Status: 200) [Size: 10]\n", encoding="utf-8"
++        )
++        (directory / f"gobuster_{SCAN_ID}.done").write_text("done", encoding="utf-8")
++        (directory / f"web_audit_{SCAN_ID}.json").write_text(json.dumps({
++            "url": "http://192.0.2.10", "http": {"status": 200}, "checks": [{
++                "name": "Content-Security-Policy", "status": "missing", "detail": "Saved header evidence"
++            }],
++        }), encoding="utf-8")
++        self.stack.enter_context(patch.object(main, "SCANS_DIR", directory))
++        self.stack.enter_context(patch.object(main, "SCAN_STATUS_FILE", directory / "scan_status.json"))
++        self.stack.enter_context(patch.object(main, "scan_status_store", {SCAN_ID: main.ScanStatus(
++            scan_id=SCAN_ID, target="192.0.2.10", status="completed", exposure="internal",
++            exposure_effective="internal", gobuster_status="completed", created_at="2026-01-01T00:00:00Z",
++        )}))
++        credential_attempt.reset_mock()
++        # Start the ASGI portal before blocking sockets: Windows asyncio creates
++        # an internal loopback socket pair when the event loop starts.
++        self.client = self.stack.enter_context(TestClient(main.app))
++        self.io_mocks = []
++        for target in (
++            "requests.sessions.Session.request", "socket.gethostbyaddr", "socket.getaddrinfo",
++            "socket.create_connection", "socket.socket.connect", "socket.socket.connect_ex",
++            "subprocess.run", "subprocess.Popen",
++        ):
++            self.io_mocks.append(self.stack.enter_context(patch(
++                target, side_effect=AssertionError(f"Read attempted external I/O: {target}")
++            )))
++        # In-process ASGI requests: no listening socket or HTTP target requests.
++
++    def assert_no_external_io(self):
++        credential_attempt.assert_not_called()
++        for mocked in self.io_mocks:
++            mocked.assert_not_called()
++
++    def test_all_get_routes_use_only_saved_data(self):
++        for route in main.app.routes:
++            if "GET" not in (getattr(route, "methods", None) or set()):
++                continue
++            path = route.path.replace("{scan_id}", SCAN_ID)
++            with self.subTest(path=path):
++                response = self.client.get(path)
++                self.assertEqual(response.status_code, 200, response.text[:200])
++        self.assertEqual(self.client.get("/static/app.js").status_code, 200)
++        self.assert_no_external_io()
++
++    def test_services_mark_unperformed_checks_and_have_local_remediation(self):
++        first = self.client.get(f"/scan/{SCAN_ID}/nvd").json()
++        self.assertEqual(first, self.client.get(f"/scan/{SCAN_ID}/nvd").json())
++        host = first["data"]["hosts"][0]
++        self.assertEqual(host["reverse_dns"], "saved.example.test")
++        self.assertEqual(len(host["services"]), 3)
++        for service in host["services"]:
++            self.assertEqual(service["weak_creds"], {"found": False, "status": "not_tested"})
++            self.assertEqual(service["nvd"]["status"], "not_queried")
++            self.assertEqual(service["nvd"]["cves"], [])
++            self.assertTrue(service["remediation"])
++        self.assert_no_external_io()
++
++    def test_pdf_and_csv_are_real_exports_without_probes(self):
++        pdf = self.client.get(f"/scan/{SCAN_ID}/report.pdf")
++        self.assertEqual(pdf.status_code, 200)
++        self.assertEqual(pdf.headers["content-type"], "application/pdf")
++        self.assertTrue(pdf.content.startswith(b"%PDF-"))
++        csv = self.client.get(f"/scan/{SCAN_ID}/findings.csv")
++        self.assertEqual(csv.status_code, 200)
++        self.assertIn("evidence,remediation", csv.text)
++        self.assertIn("Saved header evidence", csv.text)
++        self.assert_no_external_io()
++
++    def test_remediation_route_and_frontend_request_are_removed(self):
++        self.assertEqual(self.client.post(f"/scan/{SCAN_ID}/remediation", json={}).status_code, 404)
++        self.assertNotIn("/scan/{scan_id}/remediation", self.client.get("/openapi.json").json()["paths"])
++        js = self.client.get("/static/app.js").text
++        for token in ("loadLLMRemediation", "llm-remediation", "/remediation", "Generating remediation"):
++            self.assertNotIn(token, js)
++        self.assert_no_external_io()
++
++    def test_post_scan_still_schedules_network_and_web_workers(self):
++        with patch.object(main, "run_nmap_scan") as nmap, patch.object(main, "run_gobuster_scan") as web:
++            response = self.client.post("/scan", json={"target": "127.0.0.1:8080", "profile": "standard"})
++            self.assertEqual(response.status_code, 200)
++            scan_id = response.json()["scan_id"]
++            nmap.assert_called_once_with(scan_id=scan_id, target="127.0.0.1", ports="8080")
++            web.assert_called_once_with(scan_id, "http://127.0.0.1:8080")
++        self.assert_no_external_io()
++
++    def test_network_worker_still_builds_nmap_command_and_saves_xml(self):
++        def fake_nmap(command, **kwargs):
++            Path(command[command.index("-oX") + 1]).write_text(XML, encoding="utf-8")
++            return subprocess.CompletedProcess(command, 0)
++
++        with patch.object(main.subprocess, "run", side_effect=fake_nmap) as runner:
++            main.run_nmap_scan(SCAN_ID, "127.0.0.1", ports="8080")
++            command = runner.call_args.args[0]
++            self.assertEqual(command[:4], [main.NMAP_PATH, "-sV", "-T4", "-Pn"])
++            self.assertEqual(command[-1], "127.0.0.1")
++            self.assertIn("8080", command)
++            self.assertEqual(main.scan_status_store[SCAN_ID].status, "nmap_done")
++            self.assertEqual((self.directory / f"{SCAN_ID}.xml").read_text(encoding="utf-8"), XML)
++        self.assert_no_external_io()
++
++    def test_web_worker_still_saves_audit_and_gobuster_output(self):
++        def fake_gobuster(command, **kwargs):
++            Path(command[command.index("-o") + 1]).write_text(
++                "/docs (Status: 200) [Size: 10]\n", encoding="utf-8"
++            )
++            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
++
++        audit = {"url": "http://127.0.0.1:8080", "http": {"status": 200}}
++        with patch.object(main, "run_web_security_assessment", return_value=audit) as assessment:
++            with patch.object(main.subprocess, "run", side_effect=fake_gobuster) as runner:
++                main.run_gobuster_scan(SCAN_ID, audit["url"])
++                assessment.assert_called_once_with(audit["url"])
++                self.assertEqual(runner.call_args.args[0][:2], [str(main.GOBUSTER_EXE), "dir"])
++        saved = json.loads((self.directory / f"web_audit_{SCAN_ID}.json").read_text(encoding="utf-8"))
++        self.assertEqual(saved, audit)
++        self.assertEqual(main.scan_status_store[SCAN_ID].gobuster_status, "completed")
++        self.assertEqual(self.client.get(f"/webscan/{SCAN_ID}/results").json()["results"][0]["path"], "/docs")
++        self.assert_no_external_io()
++
++
++class ImportWithoutRemovedDependenciesTest(unittest.TestCase):
++    def test_startup_without_ai_or_credential_modules(self):
++        # Separate interpreter prevents an already imported dependency hiding a regression.
++        code = """
++import importlib.abc
++import sys
++class BlockRemoved(importlib.abc.MetaPathFinder):
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname in {'backend.llm_remediation', 'backend.scanner.weak_creds'} or fullname.split('.')[0] in {'google', 'paramiko'}:
++            raise AssertionError('Removed runtime dependency imported: ' + fullname)
++sys.meta_path.insert(0, BlockRemoved())
++from backend.main import app
++assert app
++"""
++        result = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True,
++                                cwd=Path(__file__).resolve().parents[1], timeout=30)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_service_details.js b/tests/test_service_details.js
+new file mode 100644
+--- /dev/null
++++ b/tests/test_service_details.js
+@@ -0,0 +1,32 @@
++// Run the actual frontend handler without a browser, server, or third-party packages.
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++
++const elements = new Map();
++const context = vm.createContext({
++  document: {
++    addEventListener() {},
++    getElementById(id) {
++      if (!elements.has(id)) elements.set(id, { style: {}, innerHTML: "", textContent: "" });
++      return elements.get(id);
++    },
++  },
++  fetch() { throw new Error("Opening details must not make an HTTP request"); },
++});
++const source = fs.readFileSync(path.join(__dirname, "../frontend/static/app.js"), "utf8");
++vm.runInContext(source, context);
++vm.runInContext(`
++  currentScanId = "synthetic-scan";
++  currentServices = [{ip: "192.0.2.10", port: 22, protocol: "tcp", service: "ssh",
++    remediation: "Restrict access to authorized clients.", weak_creds: {found: false, status: "not_tested"}}];
++  onDetailsClick({target: {getAttribute(name) {
++    return {"data-ip": "192.0.2.10", "data-port": "22", "data-proto": "tcp"}[name];
++  }}});
++`, context);
++assert.equal(elements.get("service-details-modal").style.display, "flex");
++assert.match(elements.get("modal-body").innerHTML, /Restrict access to authorized clients/);
++assert.match(elements.get("modal-body").innerHTML, /Credential testing was not performed/);
++assert.doesNotMatch(elements.get("modal-body").innerHTML, /llm-remediation|Generating remediation/);
++console.log("PASS: service details render local guidance without fetch");
+diff --git a/docs/DAY-02.md b/docs/DAY-02.md
+new file mode 100644
+--- /dev/null
++++ b/docs/DAY-02.md
+@@ -0,0 +1,173 @@
++# Day 2 — remove AI and make result reads local
++
++## Actual call paths and the change
++
++Before this change, [main.py](../backend/main.py) imported the credential
++annotation helper and a Gemini generator at module load. The `/nvd` route called
++credential annotation directly; findings/CSV called it through `enrich_scan_data`;
++PDF and the remediation POST route also called it. XML parsing did reverse DNS.
++NVD enrichment made fresh HTTP requests in service, findings, graph, and report
++reads. Opening a service detail modal in [app.js](../frontend/static/app.js)
++automatically posted to the remediation route and cached the response HTML.
++
++The implemented change removes those paths rather than masking their results:
++
++- Deleted the AI backend module and its import, request model, and POST route.
++  `/scan/{scan_id}/remediation` now returns 404 and is absent from OpenAPI.
++- Removed the frontend generated-remediation function, request, cache code, and
++  generated-content element. The existing Details button remains useful for
++  saved service/NSE evidence. It displays deterministic review guidance already
++  present in the service response; clicking it makes no additional request.
++- Removed credential annotation and live NVD calls from all result/export routes.
++  Removed fresh reverse DNS from XML parsing; a reverse hostname is shown only
++  when a PTR hostname is present in saved XML.
++- Kept `/scan/{scan_id}/nvd` for compatibility with the existing UI. Its name is
++  historical: no NVD API is called. Raw XML does not contain prior NVD enrichment
++  or credential-check results, so these fields explicitly report unperformed
++  checks instead of claiming a clean assessment.
++- Removed `google-genai` and `paramiko` from application requirements. The
++  application imports neither. The legacy credential module remains untouched
++  and unused; running it independently would require its own dependencies.
++- Updated current README setup/instructions and result labels. Historical Day 1
++  records, original ZIPs, stored scan evidence, and the unused old AI cache remain
++  preserved. They are not runtime feature implementations.
++
++New local helpers in the existing main module are `service_remediation` and
++`annotate_saved_services`. The shared annotation logic is:
++
++```python
++def annotate_saved_services(parsed: dict, exposure: str) -> None:
++    for host in parsed.get("hosts", []):
++        for service in host.get("services", []):
++            service["ip"] = host.get("ip")
++            service["weak_creds"] = {"found": False, "status": "not_tested"}
++            service["nvd"] = {"keyword": None, "cves": [], "status": "not_queried"}
++            service["remediation"] = service_remediation(service)
++            service.update(pcvp_score_for_service(service, exposure))
++```
++
++Example SSH guidance: “Restrict SSH to authorized clients, prefer key-based
++authentication, and review vendor updates.” This is general review guidance,
++not evidence that SSH or an open port is vulnerable. FTP, web, and generic
++services have similarly small fixed messages.
++
++The frontend displays `svc.remediation` using its existing HTML-escaping helper.
++PDF labels now say “Not tested” and “Not queried” rather than “None.” Normal
++scan scheduling and Nmap/Gobuster command construction were preserved.
++
++## Files supplied
++
++Modified:
++
++- [main.py](../backend/main.py): remove active result enrichment and AI route;
++  introduce the two pure local helpers; parse saved PTR data.
++- [report_generator.py](../backend/report_generator.py): accurate unperformed-check labels.
++- [app.js](../frontend/static/app.js): remove AI request/UI/cache paths; render local guidance.
++- [index.html](../frontend/templates/index.html): current result labels; increment script URL to `v=19`.
++- [requirements.txt](../requirements.txt): remove two unused runtime dependencies.
++- [README.md](../README.md): current behavior, setup, and regression commands.
++
++Deleted: the former AI remediation Python module under the backend directory.
++
++Added:
++
++- [requirements-dev.txt](../requirements-dev.txt): existing runtime requirements
++  plus pinned HTTPX 0.28.1 for FastAPI's in-process TestClient.
++- [test_read_only_endpoints.py](../tests/test_read_only_endpoints.py): eight
++  regression tests using invented XML/web files and temporary project-local storage.
++- [test_service_details.js](../tests/test_service_details.js): runs the actual
++  frontend Details handler with a small DOM stub and a throwing `fetch` function.
++- [day2-changes.patch](../artifacts/day2-changes.patch): exact unified diff of the
++  six modified tracked source/docs files, deleted AI module, new tests,
++  development requirements, and this handoff.
++- [DAY-02.md](./DAY-02.md): this handoff.
++
++## Windows PowerShell commands
++
++Use an existing working environment; the commands verified here used
++`.venv-baseline` and Python 3.14.3. On another machine, substitute the path to
++your working project's Python interpreter.
++
++```powershell
++Set-Location 'D:\security project'
++
++# For a new environment, install both runtime and test requirements.
++& '.\.venv-baseline\Scripts\python.exe' -m pip install -r '.\requirements-dev.txt'
++
++# Does not contact targets or launch scanners.
++& '.\.venv-baseline\Scripts\python.exe' -B -m unittest discover -s tests -v
++
++# Node is used only for these frontend checks; no npm install is needed.
++node --check '.\frontend\static\app.js'
++node '.\tests\test_service_details.js'
++
++git diff --check
++git diff -- backend/main.py backend/report_generator.py frontend/static/app.js frontend/templates/index.html requirements.txt README.md
++Get-Content '.\requirements-dev.txt'
++```
++
++Expected test output:
++
++```text
++Ran 8 tests in ...s
++OK
++PASS: service details render local guidance without fetch
++```
++
++HTTPX 0.28.1 was already installed in the verified environment; no dependency
++download or uninstall was performed. Installing the revised requirements does
++not uninstall old packages in an existing environment. Their presence does not
++enable any removed feature; startup is separately tested with their imports
++blocked. A clean environment will not install them via these requirements.
++
++Launch in one terminal, or restart an existing server so it loads the changes:
++
++```powershell
++& '.\.venv-baseline\Scripts\python.exe' -B -m uvicorn backend.main:app --host 127.0.0.1 --port 8787
++```
++
++In a second terminal:
++
++```powershell
++Invoke-RestMethod 'http://127.0.0.1:8787/health'
++$schema = Invoke-RestMethod 'http://127.0.0.1:8787/openapi.json'
++$schema.paths.PSObject.Properties.Name -contains '/scan/{scan_id}/remediation'
++```
++
++Expected: health `status: ok`, service `risklens-backend`; schema membership
++`False`. Hard-refresh the browser to load the new script. Do not start a new
++target scan merely to run the regression suite.
++
++## Verification and limitations
++
++All eight Python tests pass. The GET test enumerates every declared GET route
++and generated API/docs routes and checks HTTP 200 for a complete synthetic saved
++scan. During requests, it blocks Requests HTTP, DNS lookups, socket connections,
++process creation, and the legacy credential annotation helper. Mocks are asserted
++unused, so swallowing an I/O error cannot make the test pass. PDF checks real
++ReportLab output starting with `%PDF-`; CSV contains saved evidence.
++
++Other tests verify deterministic repeated service responses, explicit unperformed
++statuses, removal of the route/frontend request, startup without removed imports,
++scan scheduling, and actual scanner worker command/output flow using mocked
++external tools. The JavaScript test and Node syntax check pass. Editor diagnostics
++reported no errors in the changed Python/JavaScript files; `git diff --check` passes.
++
++The suite starts TestClient before blocking connections because Windows asyncio
++creates an internal socket pair during loop initialization. The tests run no
++real scanners, credential attempts, NVD queries, or AI calls. Temporary files are
++created in the project and cleaned up, avoiding the exhausted Windows temporary
++drive encountered during testing. An existing Starlette TemplateResponse
++deprecation warning remains; it does not fail the suite.
++
++The updated app was also launched on `127.0.0.1:8787`; startup completed, health
++and the root page returned HTTP 200, and OpenAPI omitted the removed route. Full
++browser styling/layout and real Nmap/Gobuster execution were not tested. CDN
++assets, scan-scope enforcement, scan defaults, speculative graph/scoring logic,
++and the broader findings-classification problems are outside this change. Status
++polling may still update local completion metadata; "read-only" here means no
++new target probes, credential attempts, DNS, or external enrichment. Old cached
++CVEs are not recreated from missing raw evidence.
++
++This day's scope ends with removal of AI and hidden result-read activity. No
++Exposure Change Detector or later-day refactor was implemented.
