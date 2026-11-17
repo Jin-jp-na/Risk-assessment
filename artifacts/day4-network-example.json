@@ -1,0 +1,619 @@
+{
+  "notice": "Synthetic saved XML and injected candidate; no target scan or NVD request occurred.",
+  "parsed_response": {
+    "scan_id": "synthetic",
+    "data": {
+      "hosts": [
+        {
+          "ip": "192.0.2.10",
+          "hostnames": [],
+          "reverse_dns": null,
+          "mac": null,
+          "mac_vendor": null,
+          "os": [],
+          "services": [
+            {
+              "host": "192.0.2.10",
+              "port": 22,
+              "protocol": "tcp",
+              "state": "open",
+              "service": "ssh",
+              "product": "OpenSSH",
+              "version": null,
+              "extrainfo": null,
+              "nse_findings": [],
+              "evidence": {
+                "source": "Nmap XML",
+                "artifact": "day4-example.xml",
+                "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+                "host_addresses": [
+                  {
+                    "@addr": "192.0.2.10",
+                    "@addrtype": "ipv4"
+                  }
+                ],
+                "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+                "original": {
+                  "@protocol": "tcp",
+                  "@portid": "22",
+                  "state": {
+                    "@state": "open",
+                    "@reason": "syn-ack"
+                  },
+                  "service": {
+                    "@name": "ssh",
+                    "@product": "OpenSSH"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "observations": [
+        {
+          "host": "192.0.2.10",
+          "protocol": "tcp",
+          "port": 22,
+          "state": "open",
+          "service": "ssh",
+          "product": "OpenSSH",
+          "version": null,
+          "evidence": {
+            "source": "Nmap XML",
+            "artifact": "day4-example.xml",
+            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+            "host_addresses": [
+              {
+                "@addr": "192.0.2.10",
+                "@addrtype": "ipv4"
+              }
+            ],
+            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+            "original": {
+              "@protocol": "tcp",
+              "@portid": "22",
+              "state": {
+                "@state": "open",
+                "@reason": "syn-ack"
+              },
+              "service": {
+                "@name": "ssh",
+                "@product": "OpenSSH"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "nvd_response": {
+    "scan_id": "synthetic",
+    "exposure": "external",
+    "profile": "standard",
+    "data": {
+      "hosts": [
+        {
+          "ip": "192.0.2.10",
+          "hostnames": [],
+          "reverse_dns": null,
+          "mac": null,
+          "mac_vendor": null,
+          "os": [],
+          "services": [
+            {
+              "host": "192.0.2.10",
+              "port": 22,
+              "protocol": "tcp",
+              "state": "open",
+              "service": "ssh",
+              "product": "OpenSSH",
+              "version": null,
+              "extrainfo": null,
+              "nse_findings": [],
+              "evidence": {
+                "source": "Nmap XML",
+                "artifact": "day4-example.xml",
+                "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+                "host_addresses": [
+                  {
+                    "@addr": "192.0.2.10",
+                    "@addrtype": "ipv4"
+                  }
+                ],
+                "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+                "original": {
+                  "@protocol": "tcp",
+                  "@portid": "22",
+                  "state": {
+                    "@state": "open",
+                    "@reason": "syn-ack"
+                  },
+                  "service": {
+                    "@name": "ssh",
+                    "@product": "OpenSSH"
+                  }
+                }
+              },
+              "ip": "192.0.2.10",
+              "weak_creds": {
+                "found": false,
+                "status": "not_tested"
+              },
+              "nvd": {
+                "status": "not_queried",
+                "keyword": null,
+                "cves": []
+              },
+              "remediation": "Restrict SSH to authorized clients, prefer key-based authentication, and review vendor updates.",
+              "pcvp_score": 25,
+              "pcvp_level": "low",
+              "pcvp_reasons": [
+                "Observed open port (+10 review priority); this does not establish a vulnerability.",
+                "Administrative/data service (+10 review priority); no credential or compromise claim.",
+                "External exposure context (+5) is supplied/inferred context, not verified internet reachability.",
+                "Version unknown; CVE applicability is unverified."
+              ],
+              "score_kind": "exposure_review_priority",
+              "severity": "info",
+              "verification_status": "observed",
+              "identity_confidence": "low",
+              "identity_reason": "Product or version is missing; identity is incomplete."
+            }
+          ]
+        }
+      ],
+      "observations": [
+        {
+          "host": "192.0.2.10",
+          "protocol": "tcp",
+          "port": 22,
+          "state": "open",
+          "service": "ssh",
+          "product": "OpenSSH",
+          "version": null,
+          "evidence": {
+            "source": "Nmap XML",
+            "artifact": "day4-example.xml",
+            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+            "host_addresses": [
+              {
+                "@addr": "192.0.2.10",
+                "@addrtype": "ipv4"
+              }
+            ],
+            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+            "original": {
+              "@protocol": "tcp",
+              "@portid": "22",
+              "state": {
+                "@state": "open",
+                "@reason": "syn-ack"
+              },
+              "service": {
+                "@name": "ssh",
+                "@product": "OpenSSH"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_vulnerabilities": []
+    }
+  },
+  "supplied_candidate_demonstration": {
+    "data": {
+      "hosts": [
+        {
+          "ip": "192.0.2.10",
+          "hostnames": [],
+          "reverse_dns": null,
+          "mac": null,
+          "mac_vendor": null,
+          "os": [],
+          "services": [
+            {
+              "host": "192.0.2.10",
+              "port": 22,
+              "protocol": "tcp",
+              "state": "open",
+              "service": "ssh",
+              "product": "OpenSSH",
+              "version": null,
+              "extrainfo": null,
+              "nse_findings": [],
+              "evidence": {
+                "source": "Nmap XML",
+                "artifact": "day4-example.xml",
+                "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+                "host_addresses": [
+                  {
+                    "@addr": "192.0.2.10",
+                    "@addrtype": "ipv4"
+                  }
+                ],
+                "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+                "original": {
+                  "@protocol": "tcp",
+                  "@portid": "22",
+                  "state": {
+                    "@state": "open",
+                    "@reason": "syn-ack"
+                  },
+                  "service": {
+                    "@name": "ssh",
+                    "@product": "OpenSSH"
+                  }
+                }
+              },
+              "nvd": {
+                "keyword": "OpenSSH",
+                "cves": [
+                  {
+                    "id": "SYNTHETIC-CVE",
+                    "severity": "info",
+                    "score": null,
+                    "description": "Synthetic offline example candidate; not a real advisory.",
+                    "verification_status": "unverified",
+                    "confidence": "low",
+                    "applicability": {
+                      "status": "unverified",
+                      "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
+                    },
+                    "reported_severity": "CRITICAL",
+                    "reported_cvss": 9.8,
+                    "original": {
+                      "id": "SYNTHETIC-CVE",
+                      "severity": "CRITICAL",
+                      "score": 9.8,
+                      "description": "Synthetic offline example candidate; not a real advisory."
+                    },
+                    "match_method": "keyword"
+                  }
+                ],
+                "status": "unverified_candidates"
+              },
+              "ip": "192.0.2.10",
+              "weak_creds": {
+                "found": false,
+                "status": "not_tested"
+              },
+              "remediation": "Restrict SSH to authorized clients, prefer key-based authentication, and review vendor updates.",
+              "pcvp_score": 25,
+              "pcvp_level": "low",
+              "pcvp_reasons": [
+                "Observed open port (+10 review priority); this does not establish a vulnerability.",
+                "Administrative/data service (+10 review priority); no credential or compromise claim.",
+                "External exposure context (+5) is supplied/inferred context, not verified internet reachability.",
+                "Version unknown; CVE applicability is unverified.",
+                "CVE keyword candidates do not increase severity or review priority."
+              ],
+              "score_kind": "exposure_review_priority",
+              "severity": "info",
+              "verification_status": "observed",
+              "identity_confidence": "low",
+              "identity_reason": "Product or version is missing; identity is incomplete."
+            }
+          ]
+        }
+      ],
+      "observations": [
+        {
+          "host": "192.0.2.10",
+          "protocol": "tcp",
+          "port": 22,
+          "state": "open",
+          "service": "ssh",
+          "product": "OpenSSH",
+          "version": null,
+          "evidence": {
+            "source": "Nmap XML",
+            "artifact": "day4-example.xml",
+            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+            "host_addresses": [
+              {
+                "@addr": "192.0.2.10",
+                "@addrtype": "ipv4"
+              }
+            ],
+            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+            "original": {
+              "@protocol": "tcp",
+              "@portid": "22",
+              "state": {
+                "@state": "open",
+                "@reason": "syn-ack"
+              },
+              "service": {
+                "@name": "ssh",
+                "@product": "OpenSSH"
+              }
+            }
+          }
+        }
+      ],
+      "candidate_vulnerabilities": [
+        {
+          "domain": "network",
+          "asset": "192.0.2.10:22/tcp",
+          "severity": "info",
+          "confidence_scope": "CVE_applicability",
+          "observation": {
+            "host": "192.0.2.10",
+            "protocol": "tcp",
+            "port": 22,
+            "state": "open",
+            "service": "ssh",
+            "product": "OpenSSH",
+            "version": null,
+            "evidence": {
+              "source": "Nmap XML",
+              "artifact": "day4-example.xml",
+              "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+              "host_addresses": [
+                {
+                  "@addr": "192.0.2.10",
+                  "@addrtype": "ipv4"
+                }
+              ],
+              "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+              "original": {
+                "@protocol": "tcp",
+                "@portid": "22",
+                "state": {
+                  "@state": "open",
+                  "@reason": "syn-ack"
+                },
+                "service": {
+                  "@name": "ssh",
+                  "@product": "OpenSSH"
+                }
+              }
+            }
+          },
+          "original_evidence": {
+            "source": "Nmap XML",
+            "artifact": "day4-example.xml",
+            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+            "host_addresses": [
+              {
+                "@addr": "192.0.2.10",
+                "@addrtype": "ipv4"
+              }
+            ],
+            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+            "original": {
+              "@protocol": "tcp",
+              "@portid": "22",
+              "state": {
+                "@state": "open",
+                "@reason": "syn-ack"
+              },
+              "service": {
+                "@name": "ssh",
+                "@product": "OpenSSH"
+              }
+            }
+          },
+          "cvss": null,
+          "id": "SYNTHETIC-CVE-192.0.2.10-tcp-22",
+          "cve_id": "SYNTHETIC-CVE",
+          "category": "candidate_vulnerability",
+          "rule_id": "NET-CVE-KEYWORD-001",
+          "title": "Unverified CVE candidate: SYNTHETIC-CVE",
+          "confidence": "low",
+          "verification_status": "unverified",
+          "reported_severity": "CRITICAL",
+          "reported_cvss": 9.8,
+          "applicability": {
+            "status": "unverified",
+            "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
+          },
+          "evidence": "Keyword=OpenSSH; candidate description: Synthetic offline example candidate; not a real advisory.",
+          "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown.",
+          "candidate_evidence": {
+            "id": "SYNTHETIC-CVE",
+            "severity": "info",
+            "score": null,
+            "description": "Synthetic offline example candidate; not a real advisory.",
+            "verification_status": "unverified",
+            "confidence": "low",
+            "applicability": {
+              "status": "unverified",
+              "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
+            },
+            "reported_severity": "CRITICAL",
+            "reported_cvss": 9.8,
+            "original": {
+              "id": "SYNTHETIC-CVE",
+              "severity": "CRITICAL",
+              "score": 9.8,
+              "description": "Synthetic offline example candidate; not a real advisory."
+            },
+            "match_method": "keyword"
+          },
+          "remediation": "Verify the installed product, exact version, vendor advisory and affected-version conditions before treating this candidate as applicable.",
+          "source": "NVD keyword match (unverified)"
+        }
+      ]
+    },
+    "findings": [
+      {
+        "domain": "network",
+        "asset": "192.0.2.10:22/tcp",
+        "severity": "info",
+        "confidence_scope": "port_state_only",
+        "observation": {
+          "host": "192.0.2.10",
+          "protocol": "tcp",
+          "port": 22,
+          "state": "open",
+          "service": "ssh",
+          "product": "OpenSSH",
+          "version": null,
+          "evidence": {
+            "source": "Nmap XML",
+            "artifact": "day4-example.xml",
+            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+            "host_addresses": [
+              {
+                "@addr": "192.0.2.10",
+                "@addrtype": "ipv4"
+              }
+            ],
+            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+            "original": {
+              "@protocol": "tcp",
+              "@portid": "22",
+              "state": {
+                "@state": "open",
+                "@reason": "syn-ack"
+              },
+              "service": {
+                "@name": "ssh",
+                "@product": "OpenSSH"
+              }
+            }
+          }
+        },
+        "original_evidence": {
+          "source": "Nmap XML",
+          "artifact": "day4-example.xml",
+          "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+          "host_addresses": [
+            {
+              "@addr": "192.0.2.10",
+              "@addrtype": "ipv4"
+            }
+          ],
+          "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+          "original": {
+            "@protocol": "tcp",
+            "@portid": "22",
+            "state": {
+              "@state": "open",
+              "@reason": "syn-ack"
+            },
+            "service": {
+              "@name": "ssh",
+              "@product": "OpenSSH"
+            }
+          }
+        },
+        "cvss": null,
+        "id": "OBS-192.0.2.10-tcp-22",
+        "category": "observation",
+        "rule_id": "NET-OPEN-001",
+        "title": "Observed open service: ssh",
+        "confidence": "high",
+        "verification_status": "observed",
+        "evidence": "192.0.2.10:22/tcp state=open; product=OpenSSH; version=unknown",
+        "reason": "Nmap recorded this port as open. An open service is not a confirmed vulnerability. Version is unknown; no CVE applicability can be established.",
+        "remediation": "Confirm the service is required and restrict access to authorized clients.",
+        "source": "Nmap XML"
+      },
+      {
+        "domain": "network",
+        "asset": "192.0.2.10:22/tcp",
+        "severity": "info",
+        "confidence_scope": "CVE_applicability",
+        "observation": {
+          "host": "192.0.2.10",
+          "protocol": "tcp",
+          "port": 22,
+          "state": "open",
+          "service": "ssh",
+          "product": "OpenSSH",
+          "version": null,
+          "evidence": {
+            "source": "Nmap XML",
+            "artifact": "day4-example.xml",
+            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+            "host_addresses": [
+              {
+                "@addr": "192.0.2.10",
+                "@addrtype": "ipv4"
+              }
+            ],
+            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+            "original": {
+              "@protocol": "tcp",
+              "@portid": "22",
+              "state": {
+                "@state": "open",
+                "@reason": "syn-ack"
+              },
+              "service": {
+                "@name": "ssh",
+                "@product": "OpenSSH"
+              }
+            }
+          }
+        },
+        "original_evidence": {
+          "source": "Nmap XML",
+          "artifact": "day4-example.xml",
+          "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
+          "host_addresses": [
+            {
+              "@addr": "192.0.2.10",
+              "@addrtype": "ipv4"
+            }
+          ],
+          "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
+          "original": {
+            "@protocol": "tcp",
+            "@portid": "22",
+            "state": {
+              "@state": "open",
+              "@reason": "syn-ack"
+            },
+            "service": {
+              "@name": "ssh",
+              "@product": "OpenSSH"
+            }
+          }
+        },
+        "cvss": null,
+        "id": "SYNTHETIC-CVE-192.0.2.10-tcp-22",
+        "cve_id": "SYNTHETIC-CVE",
+        "category": "candidate_vulnerability",
+        "rule_id": "NET-CVE-KEYWORD-001",
+        "title": "Unverified CVE candidate: SYNTHETIC-CVE",
+        "confidence": "low",
+        "verification_status": "unverified",
+        "reported_severity": "CRITICAL",
+        "reported_cvss": 9.8,
+        "applicability": {
+          "status": "unverified",
+          "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
+        },
+        "evidence": "Keyword=OpenSSH; candidate description: Synthetic offline example candidate; not a real advisory.",
+        "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown.",
+        "candidate_evidence": {
+          "id": "SYNTHETIC-CVE",
+          "severity": "info",
+          "score": null,
+          "description": "Synthetic offline example candidate; not a real advisory.",
+          "verification_status": "unverified",
+          "confidence": "low",
+          "applicability": {
+            "status": "unverified",
+            "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
+          },
+          "reported_severity": "CRITICAL",
+          "reported_cvss": 9.8,
+          "original": {
+            "id": "SYNTHETIC-CVE",
+            "severity": "CRITICAL",
+            "score": 9.8,
+            "description": "Synthetic offline example candidate; not a real advisory."
+          },
+          "match_method": "keyword"
+        },
+        "remediation": "Verify the installed product, exact version, vendor advisory and affected-version conditions before treating this candidate as applicable.",
+        "source": "NVD keyword match (unverified)"
+      }
+    ]
+  }
+}

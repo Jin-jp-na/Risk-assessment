@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 
 from .nvd_client import query_nvd_by_keyword
+from .network_findings import normalize_nvd_candidates
 
 
 def build_keyword_from_service(product: Optional[str], version: Optional[str]) -> Optional[str]:
@@ -86,7 +87,8 @@ def enrich_service_with_nvd(product: Optional[str], version: Optional[str]) -> D
     try:
         raw = query_nvd_by_keyword(keyword)
         cves = extract_cve_summaries(raw)
-        return {"keyword": keyword, "cves": cves}
+        return normalize_nvd_candidates({"keyword": keyword, "cves": cves, "status": "no_saved_candidates"},
+                                        {"product": product, "version": version})
     except Exception as e:
         print(f"[NVD] Error enriching {keyword}: {e}")
         return {"keyword": keyword, "error": str(e), "cves": []}

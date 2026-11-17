@@ -5,12 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>RiskLens – Security Assessment Platform</title>
 
-  <!-- Tailwind (no build step) -->
-  <script src="https://cdn.tailwindcss.com"></script>
-
-  <!-- vis-network -->
-  <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
-  <link rel="stylesheet" href="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.css"/>
+  <link rel="stylesheet" href="/static/css/app.css" />
 
   <style>
     :root {
@@ -133,7 +128,7 @@
               <input
                 id="target"
                 required
-                placeholder="scanme.nmap.org or 192.168.1.10"
+                placeholder="Approved IP or CIDR, e.g. 127.0.0.1"
                 class="mt-1 w-full min-w-0 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2 outline-none focus:ring-2 focus:ring-orange-500"
               />
             </div>
@@ -153,11 +148,11 @@
             <div class="min-w-0">
               <label class="text-xs text-slate-400">Scan profile</label>
               <select id="profile" class="mt-1 w-full min-w-0 rounded-lg bg-slate-950 border border-slate-700 px-3 py-2">
-                <option value="standard">Standard</option>
-                <option value="quick">Quick discovery</option>
-                <option value="vulnerability">Vulnerability assessment</option>
-                <option value="web">Web assessment</option>
-                <option value="full">Full lab assessment</option>
+                <option value="standard">Standard: up to 1,000 TCP ports, light version detection</option>
+                <option value="quick">Quick: up to 100 TCP ports</option>
+                <option value="web">Web only: HTTP/TLS assessment; optional path discovery</option>
+                <option value="vulnerability" disabled>Vulnerability assessment (disabled)</option>
+                <option value="full" disabled>Full lab assessment (disabled)</option>
               </select>
             </div>
 
@@ -171,6 +166,14 @@
               </button>
             </div>
           </div>
+          <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
+            <input id="authorized" type="checkbox" required />
+            I am authorized to assess this target within the configured approved scope.
+          </label>
+          <label class="mt-3 flex items-center gap-2 text-xs text-slate-300">
+            <input id="path-discovery" type="checkbox" disabled />
+            Also discover paths on this exact approved web origin (optional; 15 paths, one worker, 1-second delay).
+          </label>
         </form>
       </div>
 
@@ -183,10 +186,11 @@
     <section class="glass border border-slate-800 rounded-2xl p-4">
       <div class="flex flex-wrap gap-2">
         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-overview">Overview</button>
-        <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-services">Services</button>
+        <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-services">Network</button>
         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-findings">Findings</button>
         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-attack">Attack Graph</button>
         <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-web">Web Scan</button>
+        <button class="tab-btn px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700" data-tab="tab-compare">Compare Scans</button>
       </div>
     </section>
 
@@ -202,11 +206,11 @@
           <div class="text-3xl font-extrabold mt-2" id="stat-services">0</div>
         </div>
         <div class="glass border border-slate-800 rounded-2xl p-4">
-          <div class="text-xs text-slate-400">Critical / High</div>
+          <div class="text-xs text-slate-400">High review priority (not flaw severity)</div>
           <div class="text-3xl font-extrabold mt-2" id="stat-critical">0 / 0</div>
         </div>
         <div class="glass border border-slate-800 rounded-2xl p-4">
-          <div class="text-xs text-slate-400">Weak Cred Findings</div>
+          <div class="text-xs text-slate-400">Credential testing disabled</div>
           <div class="text-3xl font-extrabold mt-2" id="stat-weak-creds">0</div>
         </div>
       </div>
@@ -252,10 +256,10 @@
               <th class="text-left px-3 py-2">Port</th>
               <th class="text-left px-3 py-2">Service</th>
               <th class="text-left px-3 py-2">Product</th>
-              <th class="text-left px-3 py-2">Risk</th>
-              <th class="text-left px-3 py-2">Score</th>
+              <th class="text-left px-3 py-2">Review priority</th>
+              <th class="text-left px-3 py-2">Review score (0–25)</th>
               <th class="text-left px-3 py-2">Weak Creds</th>
-              <th class="text-left px-3 py-2">NSE Findings</th>
+              <th class="text-left px-3 py-2">Saved NSE output</th>
               <th class="text-left px-3 py-2">Actions</th>
             </tr>
           </thead>
@@ -268,15 +272,15 @@
     <section id="tab-findings" class="tab-panel hidden space-y-4">
       <div class="flex items-center justify-between gap-3">
         <div>
-          <div class="text-lg font-bold">Prioritized findings</div>
-          <div class="text-sm text-slate-400">Evidence-backed issues from Nmap, NVD, credential checks, and web checks.</div>
+          <div class="text-lg font-bold">Observations and unverified candidates</div>
+          <div class="text-sm text-slate-400">Network observations and CVE candidates are distinct. Web recommendations are labeled separately. Expand original evidence to inspect each rule.</div>
         </div>
         <button id="download-findings-btn" type="button" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Download CSV</button>
       </div>
       <div id="finding-summary" class="text-sm text-slate-400"></div>
       <div class="overflow-auto rounded-2xl border border-slate-800">
         <table id="findings-table" class="min-w-full text-sm">
-          <thead class="bg-slate-900 text-slate-300"><tr><th class="text-left px-3 py-2">Severity</th><th class="text-left px-3 py-2">Finding</th><th class="text-left px-3 py-2">Asset</th><th class="text-left px-3 py-2">Evidence</th><th class="text-left px-3 py-2">Source</th></tr></thead>
+          <thead class="bg-slate-900 text-slate-300"><tr><th class="text-left px-3 py-2">Severity</th><th class="text-left px-3 py-2">Type and confidence</th><th class="text-left px-3 py-2">Asset</th><th class="text-left px-3 py-2">Why and evidence</th><th class="text-left px-3 py-2">Source and rule</th></tr></thead>
           <tbody class="divide-y divide-slate-800 bg-slate-950"></tbody>
         </table>
       </div>
@@ -325,11 +329,15 @@
 
     <!-- Web tab -->
     <section id="tab-web" class="tab-panel hidden space-y-4">
-      <div class="text-lg font-bold">Web Attack Surface (Gobuster)</div>
+      <div class="text-lg font-bold">Web assessment and optional path observations</div>
       <div class="glass border border-slate-800 rounded-2xl p-4">
         <div class="font-bold mb-2">HTTP / TLS security assessment</div>
         <div id="web-assessment" class="text-sm text-slate-300">Assessment will appear after the scan completes.</div>
       </div>
+      <div id="web-findings" class="glass border border-slate-800 rounded-2xl p-4">Web configuration findings will appear here.</div>
+      <div class="text-sm text-slate-300">Path responses are observations; a discovered path or HTTP status does not establish a vulnerability.</div>
+      <div id="path-job-state" class="text-sm text-slate-300"></div>
+      <button id="stop-path-discovery" type="button" disabled class="rounded-lg border border-slate-700 px-3 py-2 text-sm disabled:opacity-50">Stop optional path discovery</button>
       <div class="overflow-auto rounded-2xl border border-slate-800">
         <table id="gobuster-table" class="min-w-full text-sm">
           <thead class="bg-slate-900 text-slate-300">
@@ -342,6 +350,16 @@
           <tbody class="divide-y divide-slate-800 bg-slate-950"></tbody>
         </table>
       </div>
+    </section>
+    <section id="tab-compare" class="tab-panel hidden glass p-4">
+      <h2>Exposure Change Detector</h2>
+      <p>Compare saved scans of the same target. No scans or external requests are started.</p>
+      <label>Baseline <select id="compare-old"><option value="">Select saved scan</option></select></label>
+      <label>Current <select id="compare-new"><option value="">Select saved scan</option></select></label>
+      <button id="compare-scans-btn" type="button">Compare saved evidence</button>
+      <button id="compare-pdf" type="button">PDF with differences</button>
+      <button id="compare-csv" type="button">CSV with differences</button>
+      <div id="comparison-results" aria-live="polite">Choose a baseline and current scan.</div>
     </section>
   </main>
 
@@ -356,7 +374,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=18"></script>
+  <script src="/static/app.js?v=27"></script>
 
   <script>
     const tabBtns = document.querySelectorAll(".tab-btn");

@@ -1,0 +1,15 @@
+about
+contact
+docs
+help
+robots.txt
+sitemap.xml
+favicon.ico
+assets
+static
+images
+css
+js
+api
+health
+status

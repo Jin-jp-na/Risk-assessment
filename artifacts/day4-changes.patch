@@ -1,0 +1,1788 @@
+diff --git a/backend/main.py b/backend/main.py
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -9,6 +9,7 @@
+ import xmltodict
+ import ipaddress
+ import json
++import hashlib
+ import socket
+ import ssl
+ import requests
+@@ -20,6 +21,7 @@
+     normalize_ports, resolve_executable, nmap_command,
+ )
+ from backend.scanner.pcvp_scoring import pcvp_score_for_service
++from backend.scanner.network_findings import normalized_observation, normalize_nvd_candidates, build_network_findings
+ from backend.scanner.attack_graph import build_attack_graph
+ from starlette.responses import StreamingResponse, Response
+ from backend.report_generator import build_pdf_report
+@@ -505,7 +507,9 @@
+ 
+     if xml_path.stat().st_size > 16 * 1024 * 1024:
+         raise ValueError("Nmap XML exceeds 16 MiB")
+-    xml_content = xml_path.read_text(encoding="utf-8")
++    xml_bytes = xml_path.read_bytes()
++    artifact_sha256 = hashlib.sha256(xml_bytes).hexdigest()
++    xml_content = xml_bytes.decode("utf-8")
+     if not xml_content.strip() or "</nmaprun>" not in xml_content:
+         raise ValueError("Nmap XML is empty or incomplete")
+     data = xmltodict.parse(xml_content, disable_entities=True)
+@@ -518,7 +522,7 @@
+     else:
+         hosts = raw_hosts
+ 
+-    parsed = {"hosts": []}
++    parsed = {"hosts": [], "observations": []}
+ 
+     for host in hosts:
+         addresses = host.get("address", [])
+@@ -530,7 +534,10 @@
+         mac_vendor = None
+         for addr in addresses:
+             if addr.get("@addrtype") in ("ipv4", "ipv6"):
+-                ip = addr.get("@addr")
++                try:
++                    ip = str(ipaddress.ip_address(addr.get("@addr")))
++                except ValueError:
++                    ip = None
+             elif addr.get("@addrtype") == "mac":
+                 mac_address = addr.get("@addr")
+                 mac_vendor = addr.get("@vendor")
+@@ -571,6 +578,8 @@
+             try:
+                 port_id = int(port_value)
+             except (TypeError, ValueError):
++                continue
++            if not 1 <= port_id <= 65535:
+                 continue
+ 
+             proto = p.get("@protocol", "tcp")
+@@ -596,6 +605,7 @@
+ 
+             services.append(
+                 {
++                    "host": ip,
+                     "port": port_id,
+                     "protocol": proto,
+                     "state": state,
+@@ -604,8 +614,16 @@
+                     "version": version,
+                     "extrainfo": extrainfo,
+                     "nse_findings": nse_findings,
++                    "evidence": {
++                        "source": "Nmap XML", "artifact": xml_path.name,
++                        "sha256": artifact_sha256,
++                        "host_addresses": addresses,
++                        "locator": f"host[{ip}]/ports/port[@protocol='{proto}'][@portid='{port_id}']",
++                        "original": p,
++                    },
+                 }
+             )
++            parsed["observations"].append(normalized_observation(ip, services[-1]))
+ 
+         parsed["hosts"].append({
+             "ip": ip,
+@@ -663,50 +681,7 @@
+ 
+ 
+ def build_findings(parsed: dict, web_assessment: Optional[dict] = None) -> list[dict]:
+-    findings: list[dict] = []
+-    for host in parsed.get("hosts", []):
+-        ip = host.get("ip") or "unknown"
+-        for service in host.get("services", []):
+-            if service.get("state") != "open":
+-                continue
+-            location = f"{ip}:{service.get('port')}/{service.get('protocol', 'tcp')}"
+-            for script in service.get("nse_findings", []):
+-                findings.append({
+-                    "id": f"NSE-{script.get('id', 'finding')}-{ip}-{service.get('port')}",
+-                    "title": f"Nmap vulnerability check: {script.get('id')}",
+-                    "severity": "high",
+-                    "confidence": "high",
+-                    "asset": location,
+-                    "evidence": script.get("output", ""),
+-                    "remediation": "Review the NSE evidence and apply the vendor-recommended fix.",
+-                    "source": "Nmap NSE",
+-                })
+-            weak = service.get("weak_creds") or {}
+-            if weak.get("found"):
+-                findings.append({
+-                    "id": f"WEAK-CREDS-{ip}-{service.get('port')}",
+-                    "title": "Weak credentials detected",
+-                    "severity": "critical",
+-                    "confidence": "high",
+-                    "asset": location,
+-                    "evidence": f"{weak.get('protocol', 'service')} accepted supplied credentials",
+-                    "remediation": "Disable default credentials and rotate the affected account.",
+-                    "source": "Credential check",
+-                })
+-            for cve in (service.get("nvd") or {}).get("cves", [])[:5]:
+-                score = cve.get("score") or 0
+-                severity = str(cve.get("severity") or "medium").lower()
+-                findings.append({
+-                    "id": cve.get("id") or "CVE-unknown",
+-                    "title": f"Known vulnerability in {service.get('product') or service.get('service') or 'service'}",
+-                    "severity": severity,
+-                    "confidence": "medium",
+-                    "asset": location,
+-                    "evidence": cve.get("description", ""),
+-                    "cvss": score,
+-                    "remediation": "Upgrade or patch the affected product and verify the service version.",
+-                    "source": "NVD",
+-                })
++    findings = build_network_findings(parsed)
+     for check in (web_assessment or {}).get("checks", []):
+         if check.get("status") == "missing":
+             findings.append({
+@@ -718,6 +693,9 @@
+                 "evidence": check.get("detail", ""),
+                 "remediation": f"Configure the {check.get('name')} response header.",
+                 "source": "HTTP assessment",
++                "domain": "web", "category": "hardening_recommendation",
++                "rule_id": "WEB-HEADER-001", "verification_status": "observed",
++                "reason": "A saved HTTP assessment recorded a missing response header; application context requires review.",
+             })
+     rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+     return sorted(findings, key=lambda item: (rank.get(item["severity"], 0), float(item.get("cvss") or 0)), reverse=True)
+@@ -744,12 +722,16 @@
+             # XML contains no credential test or NVD lookup results. Not tested
+             # is deliberately distinct from a successful negative check.
+             service["weak_creds"] = {"found": False, "status": "not_tested"}
+-            service["nvd"] = {"keyword": None, "cves": [], "status": "not_queried"}
++            service["nvd"] = normalize_nvd_candidates(service.get("nvd") or {"status": "not_queried"}, service)
+             service["remediation"] = service_remediation(service)
+             service.update(pcvp_score_for_service(service, exposure))
+-            if service.get("state") != "open":
+-                service.update(pcvp_score=0, pcvp_level="informational",
+-                               pcvp_reasons=["This port was not observed open; review its recorded state."])
++            service["identity_confidence"] = "medium" if service.get("product") and service.get("version") else "low"
++            service["identity_reason"] = ("Scanner-reported identity is not verification of an installed package."
++                                          if service["identity_confidence"] == "medium" else "Product or version is missing; identity is incomplete.")
++    parsed["observations"] = [normalized_observation(host.get("ip"), service)
++                              for host in parsed.get("hosts", []) for service in host.get("services", [])]
++    parsed["candidate_vulnerabilities"] = [finding for finding in build_network_findings(parsed)
++                                            if finding["category"] == "candidate_vulnerability"]
+ 
+ 
+ def enrich_scan_data(scan_id: str) -> tuple[dict, Optional[dict]]:
+@@ -769,17 +751,23 @@
+         raise HTTPException(status_code=404, detail="Scan output not found yet")
+     parsed, web_audit = enrich_scan_data(scan_id)
+     findings = build_findings(parsed, web_audit)
+-    counts = {level: sum(1 for f in findings if f["severity"] == level) for level in ("critical", "high", "medium", "low")}
+-    return {"scan_id": scan_id, "summary": counts, "findings": findings}
++    counts = {level: sum(1 for f in findings if f["severity"] == level) for level in ("critical", "high", "medium", "low", "info")}
++    return {"scan_id": scan_id, "summary": counts, "findings": findings,
++            "network_observations": parsed["observations"],
++            "candidate_vulnerabilities": parsed["candidate_vulnerabilities"]}
+ 
+ 
+ @app.get("/scan/{scan_id}/findings.csv")
+ def download_findings_csv(scan_id: str):
+     data = get_findings(scan_id)
+     output = io.StringIO()
+-    writer = csv.DictWriter(output, fieldnames=["id", "title", "severity", "confidence", "asset", "source", "cvss", "evidence", "remediation"])
++    writer = csv.DictWriter(output, fieldnames=["id", "title", "severity", "confidence", "asset", "source", "cvss", "evidence", "remediation",
++                                              "domain", "category", "rule_id", "reason", "verification_status", "reported_cvss", "original_evidence"], extrasaction="ignore")
+     writer.writeheader()
+-    writer.writerows(data["findings"])
++    for finding in data["findings"]:
++        row = dict(finding)
++        row["original_evidence"] = json.dumps(row.get("original_evidence", {}), sort_keys=True)
++        writer.writerow(row)
+     return Response(
+         content=output.getvalue(),
+         media_type="text/csv",
+diff --git a/backend/scanner/network_findings.py b/backend/scanner/network_findings.py
+new file mode 100644
+--- /dev/null
++++ b/backend/scanner/network_findings.py
+@@ -0,0 +1,85 @@
++"""Deterministic presentation of saved observations. No probes or CVE confirmation."""
++
++
++def normalized_observation(host: str, service: dict) -> dict:
++    return {"host": host, **{key: service.get(key) for key in
++            ("protocol", "port", "state", "service", "product", "version", "evidence")}}
++
++
++def normalize_nvd_candidates(block: dict, service: dict) -> dict:
++    """Keyword results never prove applicability, even if labeled verified upstream."""
++    candidates = []
++    for item in block.get("cves") or []:
++        if not isinstance(item, dict) or not item.get("id"):
++            continue
++        reason = "Keyword matching does not establish product/version applicability."
++        if not service.get("version"):
++            reason += " The observed version is unknown."
++        if not service.get("product"):
++            reason += " The observed product is unknown."
++        candidates.append({**item, "verification_status": "unverified", "confidence": "low",
++                           "applicability": {"status": "unverified", "reason": reason},
++                           "reported_severity": item.get("reported_severity", item.get("severity")),
++                           "reported_cvss": item.get("reported_cvss", item.get("score")),
++                           "original": item.get("original") if isinstance(item.get("original"), dict) else dict(item),
++                           "severity": "info", "score": None,
++                           "match_method": "keyword"})
++    return {**block, "keyword": block.get("keyword"), "cves": candidates,
++            "status": "unverified_candidates" if candidates else block.get("status", "not_queried")}
++
++
++def build_network_findings(parsed: dict) -> list[dict]:
++    findings = []
++    for host in parsed.get("hosts", []):
++        ip = host.get("ip")
++        if not ip:
++            continue
++        for service in host.get("services", []):
++            if service.get("state") != "open":
++                continue
++            port = service.get("port")
++            protocol = service.get("protocol", "tcp")
++            asset = f"{'[' + ip + ']' if ':' in ip else ip}:{port}/{protocol}"
++            observation = normalized_observation(ip, service)
++            evidence = service.get("evidence") or {}
++            original = evidence.get("original", {})
++            raw_state = (original.get("state") or {}).get("@state")
++            state_confidence = "high" if raw_state == "open" and evidence.get("sha256") else "low"
++            base = {"domain": "network", "asset": asset, "severity": "info", "confidence_scope": "port_state_only",
++                    "observation": observation, "original_evidence": evidence, "cvss": None}
++            reason = "Nmap recorded this port as open. An open service is not a confirmed vulnerability."
++            if not service.get("version"):
++                reason += " Version is unknown; no CVE applicability can be established."
++            findings.append({**base, "id": f"OBS-{ip}-{protocol}-{port}", "category": "observation",
++                             "rule_id": "NET-OPEN-001", "title": f"Observed open service: {service.get('service') or 'unidentified'}",
++                             "confidence": state_confidence, "verification_status": "observed",
++                             "evidence": f"{asset} state=open; product={service.get('product') or 'unknown'}; version={service.get('version') or 'unknown'}",
++                             "reason": reason, "remediation": "Confirm the service is required and restrict access to authorized clients.",
++                             "source": "Nmap XML"})
++            for script in service.get("nse_findings", []):
++                if not script.get("output"):
++                    continue
++                findings.append({**base, "id": f"NSE-{script.get('id')}-{ip}-{protocol}-{port}",
++                                 "category": "script_observation", "rule_id": "NET-NSE-REVIEW-001",
++                                 "confidence_scope": "vulnerability_interpretation",
++                                 "title": f"NSE output for review: {script.get('id')}",
++                                 "confidence": "low", "verification_status": "unreviewed",
++                                 "evidence": script["output"],
++                                 "reason": "A script produced output; no script-specific positive-evidence rule has confirmed a vulnerability.",
++                                 "remediation": "Review the original script output and vendor documentation before making a vulnerability claim.",
++                                 "source": "Nmap NSE"})
++            block = normalize_nvd_candidates(service.get("nvd") or {}, service)
++            for candidate in block["cves"]:
++                findings.append({**base, "id": f"{candidate['id']}-{ip}-{protocol}-{port}",
++                                 "cve_id": candidate["id"], "category": "candidate_vulnerability",
++                                 "rule_id": "NET-CVE-KEYWORD-001", "title": f"Unverified CVE candidate: {candidate['id']}",
++                                 "confidence": "low", "verification_status": "unverified",
++                                 "confidence_scope": "CVE_applicability",
++                                 "reported_severity": candidate["reported_severity"], "reported_cvss": candidate["reported_cvss"],
++                                 "applicability": candidate["applicability"],
++                                 "evidence": f"Keyword={block.get('keyword') or 'not recorded'}; candidate description: {candidate.get('description') or 'not recorded'}",
++                                 "reason": candidate["applicability"]["reason"],
++                                 "candidate_evidence": dict(candidate),
++                                 "remediation": "Verify the installed product, exact version, vendor advisory and affected-version conditions before treating this candidate as applicable.",
++                                 "source": "NVD keyword match (unverified)"})
++    return findings
+diff --git a/backend/scanner/pcvp_scoring.py b/backend/scanner/pcvp_scoring.py
+--- a/backend/scanner/pcvp_scoring.py
++++ b/backend/scanner/pcvp_scoring.py
+@@ -1,130 +1,27 @@
+-from typing import Dict, Any, List
++"""Compatibility fields express exposure review priority, never flaw severity."""
++
++from typing import Any, Dict
+ 
+ SENSITIVE_SERVICES = {"ssh", "rdp", "mysql", "mssql", "postgresql", "smb"}
+-WEB_SERVICES = {"http", "https"}
+-
+-
+-def base_risk(service: Dict[str, Any]) -> int:
+-    name = (service.get("service") or "").lower()
+-    port = service.get("port")
+-    if name in SENSITIVE_SERVICES or port in {22, 3389, 3306, 5432, 1433}:
+-        return 25
+-    if name in WEB_SERVICES or port in {80, 443, 8080, 8443}:
+-        return 20
+-    return 10
+-
+-
+-def exposure_risk(exposure: str) -> int:
+-    if exposure == "external":
+-        return 25
+-    if exposure == "internal":
+-        return 10
+-    return 15  # unknown / mixed
+-
+-
+-def exploitability_risk(nvd_block: Dict[str, Any]) -> int:
+-    cves = nvd_block.get("cves", []) if nvd_block else []
+-    if not cves:
+-        return 0
+-
+-    max_sev = "LOW"
+-    order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+-    for c in cves:
+-        sev = (c.get("severity") or "").upper()
+-        if sev in order and order.index(sev) > order.index(max_sev):
+-            max_sev = sev
+-
+-    if max_sev == "CRITICAL":
+-        return 25
+-    if max_sev == "HIGH":
+-        return 20
+-    if max_sev == "MEDIUM":
+-        return 10
+-    return 5  # LOW
+-
+-
+-def privilege_risk(service: Dict[str, Any]) -> int:
+-    name = (service.get("service") or "").lower()
+-    # simple assumption: these typically grant high privileges if taken over
+-    if name in {"ssh", "rdp", "smb", "mysql", "mssql", "postgresql"}:
+-        return 20
+-    if name in WEB_SERVICES:
+-        return 10
+-    return 5  # unknown
+-
+-
+-def heuristic_credential_risk(service: Dict[str, Any]) -> int:
+-    name = (service.get("service") or "").lower()
+-    if name in {"ftp", "ssh", "telnet", "rdp", "smb", "vnc"}:
+-        return 10
+-    return 0
+-
+-
+-def confirmed_credential_risk(service: Dict[str, Any]) -> int:
+-    """
+-    If later you add real testing (weak_creds module) store result as:
+-    service["weak_creds"] = {"found": True/False}
+-    """
+-    weak = (service.get("weak_creds") or {}).get("found", False)
+-    return 25 if weak else 0
+-
+-
+-def attack_path_risk(service: Dict[str, Any], exposure: str) -> int:
+-    name = (service.get("service") or "").lower()
+-    # external sensitive services are entry points
+-    if exposure == "external" and (name in SENSITIVE_SERVICES or name in WEB_SERVICES):
+-        return 10
+-    # later you can add logic for lateral movement, etc.
+-    return 0
+-
+-
+-def clamp(score: int) -> int:
+-    return max(0, min(100, score))
+ 
+ 
+ def pcvp_score_for_service(service: Dict[str, Any], exposure: str) -> Dict[str, Any]:
+-    nvd_block = service.get("nvd", {}) or {}
+-
+-    b = base_risk(service)
+-    e = exposure_risk(exposure)
+-    ex = exploitability_risk(nvd_block)
+-    p = privilege_risk(service)
+-    cred_h = heuristic_credential_risk(service)
+-    cred_c = confirmed_credential_risk(service)
+-    path = attack_path_risk(service, exposure)
+-
+-    total = b + e + ex + p + cred_h + cred_c + path
+-    total = clamp(total)
+-
+-    # Map numeric score to a label
+-    if total >= 80:
+-        level = "critical"
+-    elif total >= 60:
+-        level = "high"
+-    elif total >= 40:
+-        level = "medium"
+-    elif total >= 20:
+-        level = "low"
++    if service.get("state") != "open":
++        score = 0
++        reasons = ["This port was not observed open; review its recorded state."]
+     else:
+-        level = "informational"
+-
+-    reasons: List[str] = [
+-        f"Base service/port risk: {b}",
+-        f"Exposure ({exposure}): {e}",
+-    ]
+-    if ex > 0:
+-        reasons.append(f"Exploitability from NVD CVEs: {ex}")
+-    if p > 0:
+-        reasons.append(f"Privilege impact: {p}")
+-    if cred_h > 0:
+-        reasons.append("Service type commonly affected by weak/default credentials.")
+-    if cred_c > 0:
+-        reasons.append("Confirmed weak/default credentials detected.")
+-    if path > 0:
+-        reasons.append("Service is a likely entry point in an attack path.")
+-
+-    return {
+-        "pcvp_score": total,
+-        "pcvp_level": level,
+-        "pcvp_reasons": reasons,
+-    }
+\ No newline at end of file
++        score = 10
++        reasons = ["Observed open port (+10 review priority); this does not establish a vulnerability."]
++        if (service.get("service") or "").lower() in SENSITIVE_SERVICES or service.get("port") in {22, 3389, 3306, 1433, 5432, 445}:
++            score += 10
++            reasons.append("Administrative/data service (+10 review priority); no credential or compromise claim.")
++        if exposure == "external":
++            score += 5
++            reasons.append("External exposure context (+5) is supplied/inferred context, not verified internet reachability.")
++        if not service.get("version"):
++            reasons.append("Version unknown; CVE applicability is unverified.")
++        if (service.get("nvd") or {}).get("cves"):
++            reasons.append("CVE keyword candidates do not increase severity or review priority.")
++    return {"pcvp_score": score, "pcvp_level": "low" if score else "informational",
++            "pcvp_reasons": reasons, "score_kind": "exposure_review_priority",
++            "severity": "info", "verification_status": "observed" if score else "not_open"}
+diff --git a/backend/scanner/nvd_mapping.py b/backend/scanner/nvd_mapping.py
+--- a/backend/scanner/nvd_mapping.py
++++ b/backend/scanner/nvd_mapping.py
+@@ -1,6 +1,7 @@
+ from typing import Any, Dict, List, Optional
+ 
+ from .nvd_client import query_nvd_by_keyword
++from .network_findings import normalize_nvd_candidates
+ 
+ 
+ def build_keyword_from_service(product: Optional[str], version: Optional[str]) -> Optional[str]:
+@@ -86,7 +87,8 @@
+     try:
+         raw = query_nvd_by_keyword(keyword)
+         cves = extract_cve_summaries(raw)
+-        return {"keyword": keyword, "cves": cves}
++        return normalize_nvd_candidates({"keyword": keyword, "cves": cves, "status": "no_saved_candidates"},
++                                        {"product": product, "version": version})
+     except Exception as e:
+         print(f"[NVD] Error enriching {keyword}: {e}")
+-        return {"keyword": keyword, "error": str(e), "cves": []}
+\ No newline at end of file
++        return {"keyword": keyword, "error": str(e), "cves": []}
+diff --git a/backend/scanner/attack_graph.py b/backend/scanner/attack_graph.py
+--- a/backend/scanner/attack_graph.py
++++ b/backend/scanner/attack_graph.py
+@@ -72,8 +72,9 @@
+                     "cve_id": cve_value,
+                     "severity": c.get("severity"),
+                     "cvss": c.get("cvss") or c.get("score"),
++                    "verification_status": "unverified",
+                 })
+-                add_edge({"from": sid, "to": cid, "relation": "has_vulnerability"})
++                add_edge({"from": sid, "to": cid, "relation": "candidate_cve"})
+ 
+     high_services: List[Tuple[Dict[str, Any], Dict[str, Any]]] = [
+         (host, svc) for host in hosts
+@@ -94,4 +95,4 @@
+ 
+             add_edge({"from": sid_a, "to": sid_b, "relation": "possible_chain"})
+ 
+-    return {"nodes": nodes, "edges": edges}
+\ No newline at end of file
++    return {"nodes": nodes, "edges": edges}
+diff --git a/backend/report_generator.py b/backend/report_generator.py
+--- a/backend/report_generator.py
++++ b/backend/report_generator.py
+@@ -83,7 +83,7 @@
+         [
+             ["Hosts discovered", str(len(hosts))],
+             ["Services detected", str(len(services_flat))],
+-            ["Critical / High services", f"{critical} / {high}"],
++            ["Critical / High review levels (not flaws)", f"{critical} / {high}"],
+             ["Credential testing", "Not performed"],
+         ],
+         colWidths=[8 * cm, 6 * cm],
+@@ -150,11 +150,11 @@
+     story.append(Spacer(1, 0.7 * cm))
+ 
+     # Findings table
+-    story.append(Paragraph("Prioritized Findings", h2))
++    story.append(Paragraph("Observed Services and Review Priority", h2))
+     services_flat.sort(key=lambda s: (s.get("pcvp_score") or 0), reverse=True)
+ 
+     data = [
+-        ["Host", "Port/Proto", "Service", "Product", "RiskLens", "Weak Creds", "Top CVEs"]
++        ["Host", "Port/Proto", "Service", "Product", "Review priority", "Credential tests", "CVE candidates"]
+     ]
+     for s in services_flat[:50]:
+         wc = s.get("weak_creds") or {}
+@@ -202,7 +202,7 @@
+     story.append(table)
+     if findings:
+         story.append(Spacer(1, 0.7 * cm))
+-        story.append(Paragraph("Evidence-Based Findings", h2))
++        story.append(Paragraph("Observations and Unverified Candidates", h2))
+         finding_data = [["Severity", "Finding", "Asset", "Source"]]
+         for finding in findings[:40]:
+             finding_data.append([
+diff --git a/frontend/static/app.js b/frontend/static/app.js
+--- a/frontend/static/app.js
++++ b/frontend/static/app.js
+@@ -7,6 +7,13 @@
+   const form = document.getElementById("scan-form");
+   const statusDiv = document.getElementById("scan-status");
+   const startBtn = document.getElementById("start-scan-btn");
++  // Discard old rendered scores/claims once after the evidence rules change.
++  if (localStorage.getItem("pcvp:evidenceVersion") !== "1") {
++    for (const key of ["pcvp:lastServicesHtml", "pcvp:lastStats", "pcvp:lastServices", "pcvp:lastGraph", "pcvp:lastGraphText"]) {
++      localStorage.removeItem(key);
++    }
++    localStorage.setItem("pcvp:evidenceVersion", "1");
++  }
+ 
+   // Check server boot id to detect backend restarts and avoid restoring stale cached scans
+   try {
+@@ -110,8 +117,8 @@
+         edges.map((e) => {
+           let color = "#4b5563", dashes = false, label = "";
+           if (e.relation === "runs") { label = "runs"; color = "#6b7280"; }
+-          else if (e.relation === "has_vulnerability") { label = "has CVE"; color = "#0ea5e9"; }
+-          else if (e.relation === "possible_chain") { label = "pivot"; color = "#f97316"; dashes = true; }
++          else if ((e.relation === "candidate_cve" || e.relation === "has_vulnerability")) { label = "unverified CVE candidate"; color = "#0ea5e9"; }
++          else if (e.relation === "possible_chain") { label = "unverified association"; color = "#f97316"; dashes = true; }
+           return { from: e.from, to: e.to, color, dashes, arrows: "to", label, font: { align: "middle", color: "#9ca3af", size: 10 } };
+         })
+       );
+@@ -358,8 +365,7 @@
+     return;
+   }
+   const data = await resp.json();
+-  const counts = data.summary || {};
+-  summary.textContent = `Critical: ${counts.critical || 0} · High: ${counts.high || 0} · Medium: ${counts.medium || 0} · Low: ${counts.low || 0}`;
++  summary.textContent = `Observed open services: ${(data.network_observations || []).filter(o => o.state === "open").length} · Unverified CVE candidates: ${(data.candidate_vulnerabilities || []).length} · Web recommendations: ${(data.findings || []).filter(f => f.domain === "web").length}`;
+   const findings = data.findings || [];
+   if (!findings.length) {
+     body.innerHTML = `<tr><td colspan="5">No findings were generated.</td></tr>`;
+@@ -370,10 +376,10 @@
+     const tr = document.createElement("tr");
+     tr.innerHTML = `
+       <td class="px-3 py-2"><span class="badge badge-${escapeHtml(finding.severity || "info")}">${escapeHtml(finding.severity || "info")}</span></td>
+-      <td class="px-3 py-2">${escapeHtml(finding.title || "")}</td>
++      <td class="px-3 py-2">${escapeHtml(finding.title || "")}<div>${escapeHtml(finding.domain || "")} / ${escapeHtml(finding.category || "review")}</div><div>Confidence: ${escapeHtml(finding.confidence || "unknown")} (${escapeHtml(finding.confidence_scope || "saved check")})</div></td>
+       <td class="px-3 py-2">${escapeHtml(finding.asset || "")}</td>
+-      <td class="px-3 py-2 max-w-xl">${escapeHtml(finding.evidence || "")}</td>
+-      <td class="px-3 py-2">${escapeHtml(finding.source || "")}</td>
++      <td class="px-3 py-2 max-w-xl">${escapeHtml(finding.reason || "")}<pre style="white-space:pre-wrap">${escapeHtml(finding.evidence || "")}</pre>${finding.original_evidence ? `<details><summary>Original evidence</summary><pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(finding.original_evidence, null, 2))}</pre></details>` : ""}</td>
++      <td class="px-3 py-2">${escapeHtml(finding.source || "")}<div>${escapeHtml(finding.rule_id || "")}</div></td>
+     `;
+     body.appendChild(tr);
+   }
+@@ -622,15 +628,15 @@
+   const weakPillClass = svc.weak_creds && svc.weak_creds.found ? "pill pill-weak" : "pill";
+   const nseCount = Array.isArray(svc.nse_findings) ? svc.nse_findings.length : 0;
+   tr.innerHTML = `
+-    <td>${svc.ip || ""}</td>
++    <td>${escapeHtml(svc.ip || "")}</td>
+     <td>${svc.port}</td>
+     <td>${escapeHtml(svc.service || "")} (${escapeHtml(svc.state || "unknown")})</td>
+-    <td>${(svc.product || "") + " " + (svc.version || "")}</td>
++    <td>${escapeHtml((svc.product || "unknown") + " " + (svc.version || "unknown"))}</td>
+     <td><span class="badge ${badgeClass}">${level}</span></td>
+     <td>${svc.pcvp_score ?? ""}</td>
+     <td><span class="${weakPillClass}">${weakCredsText}</span></td>
+-    <td>${nseCount ? `<span class="pill pill-weak">${nseCount} finding(s)</span>` : "None"}</td>
+-    <td><button class="btn-link" data-ip="${svc.ip}" data-port="${svc.port}" data-proto="${svc.protocol}">Details</button></td>
++    <td>${nseCount ? `<span class="pill">${nseCount} saved output(s)</span>` : "None"}</td>
++    <td><button class="btn-link" data-ip="${escapeHtml(svc.ip)}" data-port="${svc.port}" data-proto="${escapeHtml(svc.protocol)}">Details</button></td>
+   `;
+   servicesBody.appendChild(tr);
+ }
+@@ -643,7 +649,7 @@
+ } catch (err) {
+   console.error("[loadScanResults] CATCH ERROR:", err.name, err.message);
+   console.error("[loadScanResults] Full error:", err);
+-  servicesBody.innerHTML = `<tr><td colspan="9">Error loading NVD/RiskLens data: ${err.message}</td></tr>`;
++  servicesBody.innerHTML = `<tr><td colspan="9">Error loading saved observations: ${err.message}</td></tr>`;
+ }
+ }
+ 
+@@ -828,8 +834,8 @@
+       edges.map((e) => {
+         let color = "#4b5563", dashes = false, label = "";
+         if (e.relation === "runs") { label = "runs"; color = "#6b7280"; }
+-        else if (e.relation === "has_vulnerability") { label = "has CVE"; color = "#0ea5e9"; }
+-        else if (e.relation === "possible_chain") { label = "pivot"; color = "#f97316"; dashes = true; }
++        else if ((e.relation === "candidate_cve" || e.relation === "has_vulnerability")) { label = "unverified CVE candidate"; color = "#0ea5e9"; }
++        else if (e.relation === "possible_chain") { label = "unverified association"; color = "#f97316"; dashes = true; }
+         return { from: e.from, to: e.to, color, dashes, arrows: "to", label, font: { align: "middle", color: "#9ca3af", size: 10 } };
+       })
+     );
+@@ -860,7 +866,7 @@
+         const level = (svc.pcvp_level || "").toLowerCase();
+         const score = svc.pcvp_score || 0;
+         if (!(level === "critical" || level === "high")) continue;
+-        const cveEdges = edges.filter((e) => e.from === sid && e.relation === "has_vulnerability");
++        const cveEdges = edges.filter((e) => e.from === sid && (e.relation === "candidate_cve" || e.relation === "has_vulnerability"));
+         const cveIds = cveEdges.map((e) => nodeById[e.to]).filter(Boolean).map((c) => c.cve_id || c.id || c.name).filter(Boolean);
+         const chainEdges = edges.filter((e) => e.from === sid && e.relation === "possible_chain");
+         const nextServices = chainEdges.map((e) => nodeById[e.to]).filter(Boolean).map((ns) => `${ns.service || "service"} on ${ns.ip || hostIp}:${ns.port}`);
+@@ -868,15 +874,15 @@
+       }
+     }
+ if (!chains.length) {
+-  textContainer.textContent = "No high/critical attack paths identified. Lower-risk services may exist but no strong chains.";
++  textContainer.textContent = "No high-priority services. This view does not establish exploitability or attack paths.";
+ } else {
+   let html = "<ul>";
+   for (const ch of chains) {
+     html += "<li style='margin-bottom:6px;'>";
+     html += `<strong>${ch.service}</strong> on <strong>${ch.hostIp}:${ch.port}</strong> `;
+-    html += `(RiskLens: ${ch.level.toUpperCase()} score ${ch.score})`;
+-    if (ch.cves.length) { html += "<br><span style='color:#9ca3af;'>Exploitable via:</span> " + ch.cves.map((id) => `<code>${id}</code>`).join(", "); }
+-    if (ch.nextServices.length) { html += "<br><span style='color:#9ca3af;'>Potential pivot to:</span> " + ch.nextServices.join(", "); }
++    html += `(Review priority: ${ch.level.toUpperCase()} score ${ch.score})`;
++    if (ch.cves.length) { html += "<br><span style='color:#9ca3af;'>Unverified CVE candidates:</span> " + ch.cves.map((id) => `<code>${id}</code>`).join(", "); }
++    if (ch.nextServices.length) { html += "<br><span style='color:#9ca3af;'>Unverified association with:</span> " + ch.nextServices.join(", "); }
+     html += "</li>";
+   }
+   html += "</ul>";
+@@ -909,28 +915,29 @@
+   const cves = nvd.cves || nvd.CVEs || [];
+ 
+   let html = "";
+-  html += `<div><strong>Product:</strong> ${escapeHtml(svc.product || "")} ${escapeHtml(svc.version || "")}</div>`;
++  html += `<div><strong>Observed product/version:</strong> ${escapeHtml(svc.product || "unknown")} ${escapeHtml(svc.version || "unknown")}</div>`;
++  html += `<div>Identity confidence: ${escapeHtml(svc.identity_confidence || "unknown")}. ${escapeHtml(svc.identity_reason || "Scanner observations require verification.")}</div>`;
+   html += `<div><strong>Exposure:</strong> ${escapeHtml(currentExposure || "auto")}</div>`;
+-  html += `<div><strong>RiskLens:</strong> ${escapeHtml(svc.pcvp_level || "")} (score ${svc.pcvp_score ?? ""})</div>`;
++  html += `<div><strong>Exposure review priority:</strong> ${escapeHtml(svc.pcvp_level || "")} (score ${svc.pcvp_score ?? ""}/25). Vulnerability severity: informational.</div>`;
+   if (svc.weak_creds && svc.weak_creds.found) {
+     html += `<div style="margin-top:4px;"><strong>Weak Credentials:</strong> ${escapeHtml(`${svc.weak_creds.protocol || ""} ${svc.weak_creds.username}:${svc.weak_creds.password}`)}</div>`;
+   }
+   html += `<div class="section-title">Why this is prioritized</div>`;
+   if (reasons.length) { html += "<ul>"; for (const r of reasons) html += `<li>${escapeHtml(r)}</li>`; html += "</ul>"; }
+   else { html += "<div>No reasons available.</div>"; }
+-  html += `<div class="section-title">Mapped CVEs</div>`;
++  html += `<div class="section-title">Unverified CVE candidates — applicability not established</div>`;
+   if (cves.length) {
+     html += "<ul>";
+     for (const c of cves) {
+       const id = c.cve_id || c.id || "Unknown";
+-      const sev = c.severity || c.SEVERITY || "Unknown";
+-      const score = c.score || c.cvss || c.CVSS || "";
+-      html += `<li>${escapeHtml(id)} (severity: ${escapeHtml(sev)}, score: ${escapeHtml(score)})</li>`;
++      const sev = c.reported_severity || "Unknown";
++      const score = c.reported_cvss ?? "unknown";
++      html += `<li>${escapeHtml(id)} — unverified keyword candidate. Advisory severity: ${escapeHtml(sev)}; advisory CVSS: ${escapeHtml(score)} (not an asset rating). ${escapeHtml(c.applicability?.reason || "Product/version applicability requires verification.")}</li>`;
+     }
+     html += "</ul>";
+   } else { html += "<div>NVD was not queried. An empty list does not confirm the absence of vulnerabilities.</div>"; }
+   const nseFindings = Array.isArray(svc.nse_findings) ? svc.nse_findings : [];
+-  html += `<div class="section-title">Nmap NSE vulnerability evidence</div>`;
++  html += `<div class="section-title">Saved NSE output — interpretation unreviewed</div>`;
+   if (nseFindings.length) {
+     html += "<ul>";
+     for (const finding of nseFindings) {
+@@ -938,9 +945,10 @@
+     }
+     html += "</ul>";
+   } else {
+-    html += "<div>No NSE vulnerability evidence reported for this service.</div>";
++    html += "<div>No saved NSE output for this service.</div>";
+   }
+   html += `<div class="section-title">Review guidance</div>`;
++  html += `<details><summary>Original network evidence</summary><pre style="white-space:pre-wrap">${escapeHtml(JSON.stringify(svc.evidence || {}, null, 2))}</pre></details>`;
+   html += `<div>${escapeHtml(svc.remediation || "Confirm this service is required and restrict access to authorized clients.")}</div>`;
+   html += `<div style="margin-top:6px; color:#9ca3af;">Credential testing was not performed. This guidance does not establish a vulnerability.</div>`;
+   body.innerHTML = html;
+@@ -948,7 +956,7 @@
+ }
+ 
+ function escapeHtml(str) {
+-  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
++  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+ }
+ 
+ function downloadReport() {
+diff --git a/frontend/templates/index.html b/frontend/templates/index.html
+--- a/frontend/templates/index.html
++++ b/frontend/templates/index.html
+@@ -206,7 +206,7 @@
+           <div class="text-3xl font-extrabold mt-2" id="stat-services">0</div>
+         </div>
+         <div class="glass border border-slate-800 rounded-2xl p-4">
+-          <div class="text-xs text-slate-400">Critical / High</div>
++          <div class="text-xs text-slate-400">High review priority (not flaw severity)</div>
+           <div class="text-3xl font-extrabold mt-2" id="stat-critical">0 / 0</div>
+         </div>
+         <div class="glass border border-slate-800 rounded-2xl p-4">
+@@ -256,10 +256,10 @@
+               <th class="text-left px-3 py-2">Port</th>
+               <th class="text-left px-3 py-2">Service</th>
+               <th class="text-left px-3 py-2">Product</th>
+-              <th class="text-left px-3 py-2">Risk</th>
+-              <th class="text-left px-3 py-2">Score</th>
++              <th class="text-left px-3 py-2">Review priority</th>
++              <th class="text-left px-3 py-2">Review score (0–25)</th>
+               <th class="text-left px-3 py-2">Weak Creds</th>
+-              <th class="text-left px-3 py-2">NSE Findings</th>
++              <th class="text-left px-3 py-2">Saved NSE output</th>
+               <th class="text-left px-3 py-2">Actions</th>
+             </tr>
+           </thead>
+@@ -272,15 +272,15 @@
+     <section id="tab-findings" class="tab-panel hidden space-y-4">
+       <div class="flex items-center justify-between gap-3">
+         <div>
+-          <div class="text-lg font-bold">Prioritized findings</div>
+-          <div class="text-sm text-slate-400">Saved Nmap and web evidence. Credential testing and live NVD lookups are disabled.</div>
++          <div class="text-lg font-bold">Observations and unverified candidates</div>
++          <div class="text-sm text-slate-400">Network observations and CVE candidates are distinct. Web recommendations are labeled separately. Expand original evidence to inspect each rule.</div>
+         </div>
+         <button id="download-findings-btn" type="button" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Download CSV</button>
+       </div>
+       <div id="finding-summary" class="text-sm text-slate-400"></div>
+       <div class="overflow-auto rounded-2xl border border-slate-800">
+         <table id="findings-table" class="min-w-full text-sm">
+-          <thead class="bg-slate-900 text-slate-300"><tr><th class="text-left px-3 py-2">Severity</th><th class="text-left px-3 py-2">Finding</th><th class="text-left px-3 py-2">Asset</th><th class="text-left px-3 py-2">Evidence</th><th class="text-left px-3 py-2">Source</th></tr></thead>
++          <thead class="bg-slate-900 text-slate-300"><tr><th class="text-left px-3 py-2">Severity</th><th class="text-left px-3 py-2">Type and confidence</th><th class="text-left px-3 py-2">Asset</th><th class="text-left px-3 py-2">Why and evidence</th><th class="text-left px-3 py-2">Source and rule</th></tr></thead>
+           <tbody class="divide-y divide-slate-800 bg-slate-950"></tbody>
+         </table>
+       </div>
+@@ -360,7 +360,7 @@
+     </div>
+   </div>
+ 
+-  <script src="/static/app.js?v=20"></script>
++  <script src="/static/app.js?v=21"></script>
+ 
+   <script>
+     const tabBtns = document.querySelectorAll(".tab-btn");
+diff --git a/tests/test_network_findings.py b/tests/test_network_findings.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_network_findings.py
+@@ -0,0 +1,132 @@
++"""Evidence and severity regressions using synthetic saved XML and candidate data."""
++
++import hashlib
++from unittest.mock import patch
++import unittest
++
++import test_read_only_endpoints as fixtures
++from backend import main
++from backend.scanner.pcvp_scoring import pcvp_score_for_service
++from backend.scanner.network_findings import normalize_nvd_candidates
++from backend.scanner.nvd_mapping import enrich_service_with_nvd
++from backend.scanner.attack_graph import build_attack_graph
++
++
++class NetworkFindingsTest(fixtures.SavedScanFixture):
++    def parsed(self):
++        return main.parse_nmap_xml(self.directory / f"{fixtures.SCAN_ID}.xml")
++
++    def test_open_ssh_only_is_observation_not_critical_flaw(self):
++        parsed = self.parsed()
++        main.annotate_saved_services(parsed, "external")
++        ssh = next(s for s in parsed["hosts"][0]["services"] if s["port"] == 22)
++        self.assertEqual(ssh["pcvp_score"], 25)
++        self.assertEqual(ssh["pcvp_level"], "low")
++        self.assertEqual(ssh["severity"], "info")
++        findings = main.build_findings(parsed)
++        self.assertEqual({f["category"] for f in findings}, {"observation"})
++        self.assertEqual({f["severity"] for f in findings}, {"info"})
++        self.assertEqual({f["confidence"] for f in findings}, {"high"})
++        self.assertTrue(all(f["confidence_scope"] == "port_state_only" for f in findings))
++        self.assert_no_external_io()
++
++    def test_unknown_version_remains_unknown_and_has_low_identity_confidence(self):
++        path = self.directory / f"{fixtures.SCAN_ID}.xml"
++        path.write_text(fixtures.XML.replace(' version="1.0"/>', '/>'), encoding="utf-8")
++        parsed = self.parsed()
++        main.annotate_saved_services(parsed, "external")
++        for service in parsed["hosts"][0]["services"]:
++            self.assertIsNone(service["version"])
++            self.assertEqual(service["identity_confidence"], "low")
++            self.assertTrue(any("Version unknown" in reason for reason in service["pcvp_reasons"]))
++        self.assertTrue(all("Version is unknown" in finding["reason"] for finding in main.build_findings(parsed)))
++        self.assert_no_external_io()
++
++    def test_candidate_cve_is_unverified_and_does_not_raise_severity(self):
++        parsed = self.parsed()
++        service = parsed["hosts"][0]["services"][1]
++        before = pcvp_score_for_service(service, "external")["pcvp_score"]
++        service["version"] = None
++        service["nvd"] = {"keyword": "Synthetic SSH", "cves": [{
++            "id": "SYNTHETIC-CVE", "severity": "CRITICAL", "score": 9.8,
++            "description": "Invented candidate for regression testing, not a real advisory.",
++            "verification_status": "confirmed", "applicability": {"status": "verified"},
++        }]}
++        main.annotate_saved_services(parsed, "external")
++        candidates = parsed["candidate_vulnerabilities"]
++        self.assertEqual(len(candidates), 1)
++        candidate = candidates[0]
++        self.assertEqual(candidate["category"], "candidate_vulnerability")
++        self.assertEqual(candidate["verification_status"], "unverified")
++        self.assertEqual(candidate["severity"], "info")
++        self.assertEqual(candidate["confidence"], "low")
++        self.assertIsNone(candidate["cvss"])
++        self.assertEqual(candidate["reported_cvss"], 9.8)
++        self.assertEqual(candidate["reported_severity"], "CRITICAL")
++        self.assertIn("unknown", candidate["applicability"]["reason"])
++        self.assertEqual(service["pcvp_score"], before)
++        self.assertEqual(service["nvd"]["cves"][0]["severity"], "info")
++        self.assert_no_external_io()
++
++    def test_known_version_alone_cannot_confirm_keyword_applicability(self):
++        service = {"product": "Synthetic SSH", "version": "1.0"}
++        result = normalize_nvd_candidates({"cves": [{"id": "SYNTHETIC-CVE", "score": 9.8}]}, service)
++        self.assertEqual(result["cves"][0]["applicability"]["status"], "unverified")
++        self.assertEqual(result, normalize_nvd_candidates(result, service))
++
++    def test_normalized_observations_retain_original_evidence(self):
++        result = self.client.get(f"/scan/{fixtures.SCAN_ID}/parsed").json()["data"]
++        observation = result["observations"][0]
++        self.assertEqual(set(observation), {"host", "protocol", "port", "state", "service", "product", "version", "evidence"})
++        self.assertEqual(observation["host"], "192.0.2.10")
++        evidence = observation["evidence"]
++        path = self.directory / f"{fixtures.SCAN_ID}.xml"
++        self.assertEqual(evidence["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
++        self.assertEqual(evidence["artifact"], path.name)
++        self.assertEqual(evidence["original"]["state"]["@state"], observation["state"])
++        self.assertEqual(evidence["original"]["@portid"], str(observation["port"]))
++        self.assert_no_external_io()
++
++    def test_negative_and_positive_nse_strings_are_not_automatically_high_findings(self):
++        parsed = self.parsed()
++        parsed["hosts"][0]["services"][0]["nse_findings"] = [
++            {"id": "synthetic-negative", "output": "NOT VULNERABLE"},
++            {"id": "synthetic-positive", "output": "VULNERABLE"},
++        ]
++        findings = main.build_findings(parsed)
++        scripts = [f for f in findings if f["category"] == "script_observation"]
++        self.assertEqual(len(scripts), 2)
++        self.assertEqual({f["severity"] for f in scripts}, {"info"})
++        self.assertEqual({f["verification_status"] for f in scripts}, {"unreviewed"})
++
++    def test_findings_api_exposes_separate_observations_and_candidates(self):
++        result = self.client.get(f"/scan/{fixtures.SCAN_ID}/findings").json()
++        self.assertEqual(len(result["network_observations"]), 3)
++        self.assertEqual(result["candidate_vulnerabilities"], [])
++        for finding in result["findings"]:
++            self.assertIn("rule_id", finding)
++            self.assertTrue(finding["reason"])
++            self.assertIn("domain", finding)
++        self.assert_no_external_io()
++
++    def test_optional_nvd_helper_labels_keyword_results_at_the_producer(self):
++        raw = {"vulnerabilities": [{"cve": {"id": "SYNTHETIC-CVE", "descriptions": []}}]}
++        with patch("backend.scanner.nvd_mapping.query_nvd_by_keyword", return_value=raw):
++            result = enrich_service_with_nvd("Synthetic SSH", "1.0")
++        self.assertEqual(result["status"], "unverified_candidates")
++        self.assertEqual(result["cves"][0]["verification_status"], "unverified")
++        self.assert_no_external_io()
++
++    def test_graph_labels_candidates_without_claiming_applicability(self):
++        parsed = self.parsed()
++        parsed["hosts"][0]["services"][0]["nvd"] = {"cves": [{"id": "SYNTHETIC-CVE", "score": 9.8}]}
++        main.annotate_saved_services(parsed, "external")
++        graph = build_attack_graph(parsed)
++        relations = {edge["relation"] for edge in graph["edges"]}
++        self.assertIn("candidate_cve", relations)
++        self.assertNotIn("has_vulnerability", relations)
++        self.assertNotIn("possible_chain", relations)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_service_details.js b/tests/test_service_details.js
+--- a/tests/test_service_details.js
++++ b/tests/test_service_details.js
+@@ -29,4 +29,15 @@
+ assert.match(elements.get("modal-body").innerHTML, /Restrict access to authorized clients/);
+ assert.match(elements.get("modal-body").innerHTML, /Credential testing was not performed/);
+ assert.doesNotMatch(elements.get("modal-body").innerHTML, /llm-remediation|Generating remediation/);
++assert.match(elements.get("modal-body").innerHTML, /Exposure review priority/);
++assert.match(elements.get("modal-body").innerHTML, /Vulnerability severity: informational/);
++assert.match(elements.get("modal-body").innerHTML, /Original network evidence/);
++vm.runInContext(`
++  currentServices[0].nvd = {cves: [{id: "SYNTHETIC-CVE", reported_severity: "CRITICAL", reported_cvss: 9.8}]};
++  onDetailsClick({target: {getAttribute(name) {
++    return {"data-ip": "192.0.2.10", "data-port": "22", "data-proto": "tcp"}[name];
++  }}});
++`, context);
++assert.match(elements.get("modal-body").innerHTML, /unverified keyword candidate/);
++assert.match(elements.get("modal-body").innerHTML, /not an asset rating/);
+ console.log("PASS: service details render local guidance without fetch");
+diff --git a/docs/DAY-04.md b/docs/DAY-04.md
+new file mode 100644
+--- /dev/null
++++ b/docs/DAY-04.md
+@@ -0,0 +1,242 @@
++# Day 4 — explainable network observations and unverified CVE candidates
++
++## Actual output inspected before editing
++
++The current parser, annotation and findings builder were executed against invented
++saved XML containing one open SSH port. No target or NVD service was contacted.
++The original `/parsed` envelope was:
++
++```json
++{
++  "scan_id": "synthetic",
++  "data": {
++    "hosts": [{
++      "ip": "192.0.2.10", "hostnames": [], "reverse_dns": null,
++      "mac": null, "mac_vendor": null, "os": [],
++      "services": [{
++        "port": 22, "protocol": "tcp", "state": "open", "service": "ssh",
++        "product": "OpenSSH", "version": null, "extrainfo": null,
++        "nse_findings": []
++      }]
++    }]
++  }
++}
++```
++
++`/nvd` preserved this host/service structure and added `ip`, `weak_creds`, `nvd`,
++`remediation`, `pcvp_score`, `pcvp_level`, and `pcvp_reasons` to each service.
++The observed SSH-only case scored **90 / critical**, using assumed privilege,
++credential risk and attack-path points despite no such evidence. Injecting an
++invented keyword candidate made the old findings builder emit “Known
++vulnerability in OpenSSH” with critical severity. Every NSE output was also
++automatically high/high, including `NOT VULNERABLE` output. This was reproduced
++before changing those rules.
++
++## Output now
++
++Existing routes and host/service fields remain. The parser adds a flat
++`data.observations` array with these exact keys:
++
++```text
++host, protocol, port, state, service, product, version, evidence
++```
++
++Example observation, shortened only for documentation:
++
++```json
++{
++  "host": "192.0.2.10",
++  "protocol": "tcp",
++  "port": 22,
++  "state": "open",
++  "service": "ssh",
++  "product": "OpenSSH",
++  "version": null,
++  "evidence": {
++    "source": "Nmap XML",
++    "artifact": "day4-example.xml",
++    "sha256": "<SHA-256 of the actual XML bytes>",
++    "host_addresses": [{"@addr": "192.0.2.10", "@addrtype": "ipv4"}],
++    "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++    "original": {
++      "@protocol": "tcp", "@portid": "22",
++      "state": {"@state": "open", "@reason": "syn-ack"},
++      "service": {"@name": "ssh", "@product": "OpenSSH"}
++    }
++  }
++}
++```
++
++The exact generated JSON and real hash are in
++[day4-network-example.json](../artifacts/day4-network-example.json), backed by
++[day4-example.xml](../artifacts/day4-example.xml). Both are clearly synthetic,
++not assertions about a real target. `original` is the parsed original port
++record, not a byte-for-byte XML fragment; the file/hash retains the byte-level
++source. The locator is a human-readable record selector, not executable XPath.
++The hash is computed once per parse. Host IPs are canonicalized; unknown versions
++remain null and invalid numeric ports are not invented into observations.
++
++`/nvd` still does not query NVD. It adds bounded exposure-review fields and
++`data.candidate_vulnerabilities`. Ordinary XML-only results have an empty candidate
++array and NVD status `not_queried`. If local candidate data is supplied to the
++existing annotation/findings helpers, it is normalized conservatively:
++
++```json
++{
++  "category": "candidate_vulnerability",
++  "domain": "network",
++  "title": "Unverified CVE candidate: SYNTHETIC-CVE",
++  "rule_id": "NET-CVE-KEYWORD-001",
++  "severity": "info",
++  "confidence": "low",
++  "confidence_scope": "CVE_applicability",
++  "verification_status": "unverified",
++  "cvss": null,
++  "reported_severity": "CRITICAL",
++  "reported_cvss": 9.8,
++  "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
++}
++```
++
++The full object also includes the observed endpoint, normalized observation,
++original Nmap evidence, original candidate metadata, and local review guidance.
++The candidate's advisory severity/CVSS is reference metadata, never an asset
++rating. Even an upstream `verified`/`confirmed` flag cannot promote a keyword
++match. Merely having a product name and banner version does not confirm that a
++CVE applies. No applicability verifier or automatic confirmation is implemented.
++
++`GET /scan/{id}/findings` preserves `scan_id`, `summary`, and `findings`, and adds
++separate `network_observations` and `candidate_vulnerabilities` arrays. The
++compatibility findings list contains explicitly typed observations, script output,
++candidates, and web recommendations. Every network entry has a rule ID, reason,
++severity, scoped confidence, verification status, affected endpoint, and source
++evidence. Web records have `domain: web` and a hardening-recommendation category;
++their existing header rules were not broadened this day.
++
++## Deterministic rules
++
++| Rule | Trigger | Severity / confidence | Meaning |
++|---|---|---|---|
++| `NET-OPEN-001` | Nmap reports `state=open` | Info; high confidence only in the recorded port state when original XML/hash exists, otherwise low | Open service observation; not a vulnerability. |
++| `NET-NSE-REVIEW-001` | Saved nonempty NSE output | Info / low vulnerability-interpretation confidence | Retain output for review; arbitrary positive or negative words do not establish a flaw. |
++| `NET-CVE-KEYWORD-001` | Supplied keyword candidate with an ID | Info / low applicability confidence; unverified | Product/version/advisory conditions still need verification. |
++| Non-open port | Closed/filtered/unknown state | No open-service finding; review score 0 | Preserve the normalized state, do not claim exposure. |
++
++Product/version identity confidence is low when either is missing, medium when
++both are scanner-reported. This concerns scanner identity only and never proves
++installed-package identity or CVE applicability. State confidence and applicability
++confidence are deliberately different claims.
++
++The old `pcvp_*` response fields are kept for compatibility, but mean exposure
++review priority now:
++
++```text
++Observed open port:                         +10
++Administrative/data service or listed port: +10
++External exposure context:                   +5
++Maximum:                                    25
++Non-open state:                               0
++Keyword candidate / assumed compromise:      +0
++```
++
++Any nonzero review priority has label `low`; zero is `informational`.
++`score_kind` explicitly says `exposure_review_priority`; network severity is
++separately `info`. Thus external open SSH is **25 / low review priority / info
++severity**, not a confirmed critical flaw. Exposure context is not proof of
++internet reachability. Removed privilege, weak-password, exploitability and
++attack-path assumptions do not contribute points.
++
++## Relevant changes only
++
++- [main.py](../backend/main.py): normalized observations with original evidence;
++  conservative local annotation; separate API arrays; CSV rule/reason/type/source
++  columns and JSON-serialized original evidence. Scan scheduling, profiles,
++  authorization policy, subprocesses, and JSON persistence were not changed.
++- [network_findings.py](../backend/scanner/network_findings.py), new: pure network
++  observation/candidate rules and normalization, no I/O or new packages.
++- [pcvp_scoring.py](../backend/scanner/pcvp_scoring.py): bounded review priority,
++  independent informational severity, explicit reasons.
++- [nvd_mapping.py](../backend/scanner/nvd_mapping.py): the optional legacy keyword
++  helper marks results unverified at its producer too. It is still not invoked
++  by result reads; tests mock its HTTP-query boundary.
++- [attack_graph.py](../backend/scanner/attack_graph.py): CVE relation says
++  `candidate_cve`, with unverified node status. No applicability claim.
++- [report_generator.py](../backend/report_generator.py): relevant headings/labels
++  distinguish service review priority and candidate CVEs; report generation is
++  otherwise unchanged.
++- [app.js](../frontend/static/app.js) and [index.html](../frontend/templates/index.html):
++  show review priority, advisory-versus-asset severity, confidence scope, rule,
++  reason, and expandable original evidence. Escape evidence and service strings.
++  Existing graph association labels are explicitly unverified. Old rendered
++  score/graph caches are invalidated once and the script URL advances to v21.
++- [test_network_findings.py](../tests/test_network_findings.py), new: nine tests.
++- [test_service_details.js](../tests/test_service_details.js): additional assertions
++  for original evidence and unverified advisory labels, still forbidding fetch.
++- [DAY-04.md](./DAY-04.md), synthetic example files, and
++  [day4-changes.patch](../artifacts/day4-changes.patch): this day's handoff and
++  exact diff against saved Day 3 state, preserving earlier uncommitted work.
++
++The attached [weak_creds.py](../backend/scanner/weak_creds.py) was not modified or
++enabled. The application still does not import or call it.
++
++## PowerShell tests, run commands, and expected output
++
++```powershell
++Set-Location 'D:\security project'
++# Only if development requirements are not already installed:
++& '.\.venv-baseline\Scripts\python.exe' -m pip install -r '.\requirements-dev.txt'
++
++& '.\.venv-baseline\Scripts\python.exe' -B -m unittest discover -s tests -p test_network_findings.py -v
++& '.\.venv-baseline\Scripts\python.exe' -B -m unittest discover -s tests -v
++node --check '.\frontend\static\app.js'
++node '.\tests\test_service_details.js'
++git diff --check
++```
++
++Verified using the existing Python 3.14.3 environment:
++
++```text
++Focused network suite: 9 tests, OK
++Full Python suite:    38 tests, OK
++PASS: service details render local guidance without fetch
++```
++
++The required open-service-only, unknown-version, and candidate-CVE tests are
++included, plus raw evidence/hash, unknown applicability despite a known version,
++NSE strings, API separation, producer labeling, and graph candidate labels.
++Earlier scope/profile/failure/read-only/PDF/CSV tests still pass. No scans, NVD
++requests, credentials, or AI calls were performed. An existing TemplateResponse
++deprecation warning remains.
++
++Restart the existing server to load code changes; do not start a second server
++on an occupied port. Existing Day 3 scope configuration still applies:
++
++```powershell
++$env:RISKLENS_ALLOWED_TARGETS = '127.0.0.1/32'
++& '.\.venv-baseline\Scripts\python.exe' -B -m uvicorn backend.main:app --host 127.0.0.1 --port 8787
++```
++
++For an existing saved scan ID, read results without initiating a new scan:
++
++```powershell
++$scanId = 'replace-with-an-existing-scan-id'
++$parsed = Invoke-RestMethod "http://127.0.0.1:8787/scan/$scanId/parsed"
++$parsed.data.observations | ConvertTo-Json -Depth 12
++$findings = Invoke-RestMethod "http://127.0.0.1:8787/scan/$scanId/findings"
++$findings.findings | Select-Object domain,category,severity,confidence,rule_id,reason | Format-List
++```
++
++Expected: original observations with evidence references; open services are info
++observations; any supplied keyword candidate is unverified/info/low confidence.
++Hard-refresh the page for the new script. No real server launch or browser layout
++test was performed this day; API handlers were tested in-process.
++
++## Limitations and stop
++
++This is a conservative evidence presentation layer, not a CVE applicability
++engine. No candidate-import UI, offline CVE database, affected-version range/CPE
++validator, script-specific vulnerability verifier, or manual confirmation workflow
++was added. Current XML-only `/nvd` reads remain `not_queried`; the example candidate
++is explicitly injected offline for demonstration. There are no automatically
++confirmed network vulnerabilities from these rules. Web assessment semantics and
++the Exposure Change Detector remain outside today's scope. Stop here.
+diff --git a/artifacts/day4-example.xml b/artifacts/day4-example.xml
+new file mode 100644
+--- /dev/null
++++ b/artifacts/day4-example.xml
+@@ -0,0 +1 @@
++<nmaprun><host><address addr="192.0.2.10" addrtype="ipv4"/><ports><port protocol="tcp" portid="22"><state state="open" reason="syn-ack"/><service name="ssh" product="OpenSSH"/></port></ports></host></nmaprun>
+diff --git a/artifacts/day4-network-example.json b/artifacts/day4-network-example.json
+new file mode 100644
+--- /dev/null
++++ b/artifacts/day4-network-example.json
+@@ -0,0 +1,619 @@
++{
++  "notice": "Synthetic saved XML and injected candidate; no target scan or NVD request occurred.",
++  "parsed_response": {
++    "scan_id": "synthetic",
++    "data": {
++      "hosts": [
++        {
++          "ip": "192.0.2.10",
++          "hostnames": [],
++          "reverse_dns": null,
++          "mac": null,
++          "mac_vendor": null,
++          "os": [],
++          "services": [
++            {
++              "host": "192.0.2.10",
++              "port": 22,
++              "protocol": "tcp",
++              "state": "open",
++              "service": "ssh",
++              "product": "OpenSSH",
++              "version": null,
++              "extrainfo": null,
++              "nse_findings": [],
++              "evidence": {
++                "source": "Nmap XML",
++                "artifact": "day4-example.xml",
++                "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++                "host_addresses": [
++                  {
++                    "@addr": "192.0.2.10",
++                    "@addrtype": "ipv4"
++                  }
++                ],
++                "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++                "original": {
++                  "@protocol": "tcp",
++                  "@portid": "22",
++                  "state": {
++                    "@state": "open",
++                    "@reason": "syn-ack"
++                  },
++                  "service": {
++                    "@name": "ssh",
++                    "@product": "OpenSSH"
++                  }
++                }
++              }
++            }
++          ]
++        }
++      ],
++      "observations": [
++        {
++          "host": "192.0.2.10",
++          "protocol": "tcp",
++          "port": 22,
++          "state": "open",
++          "service": "ssh",
++          "product": "OpenSSH",
++          "version": null,
++          "evidence": {
++            "source": "Nmap XML",
++            "artifact": "day4-example.xml",
++            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++            "host_addresses": [
++              {
++                "@addr": "192.0.2.10",
++                "@addrtype": "ipv4"
++              }
++            ],
++            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++            "original": {
++              "@protocol": "tcp",
++              "@portid": "22",
++              "state": {
++                "@state": "open",
++                "@reason": "syn-ack"
++              },
++              "service": {
++                "@name": "ssh",
++                "@product": "OpenSSH"
++              }
++            }
++          }
++        }
++      ]
++    }
++  },
++  "nvd_response": {
++    "scan_id": "synthetic",
++    "exposure": "external",
++    "profile": "standard",
++    "data": {
++      "hosts": [
++        {
++          "ip": "192.0.2.10",
++          "hostnames": [],
++          "reverse_dns": null,
++          "mac": null,
++          "mac_vendor": null,
++          "os": [],
++          "services": [
++            {
++              "host": "192.0.2.10",
++              "port": 22,
++              "protocol": "tcp",
++              "state": "open",
++              "service": "ssh",
++              "product": "OpenSSH",
++              "version": null,
++              "extrainfo": null,
++              "nse_findings": [],
++              "evidence": {
++                "source": "Nmap XML",
++                "artifact": "day4-example.xml",
++                "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++                "host_addresses": [
++                  {
++                    "@addr": "192.0.2.10",
++                    "@addrtype": "ipv4"
++                  }
++                ],
++                "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++                "original": {
++                  "@protocol": "tcp",
++                  "@portid": "22",
++                  "state": {
++                    "@state": "open",
++                    "@reason": "syn-ack"
++                  },
++                  "service": {
++                    "@name": "ssh",
++                    "@product": "OpenSSH"
++                  }
++                }
++              },
++              "ip": "192.0.2.10",
++              "weak_creds": {
++                "found": false,
++                "status": "not_tested"
++              },
++              "nvd": {
++                "status": "not_queried",
++                "keyword": null,
++                "cves": []
++              },
++              "remediation": "Restrict SSH to authorized clients, prefer key-based authentication, and review vendor updates.",
++              "pcvp_score": 25,
++              "pcvp_level": "low",
++              "pcvp_reasons": [
++                "Observed open port (+10 review priority); this does not establish a vulnerability.",
++                "Administrative/data service (+10 review priority); no credential or compromise claim.",
++                "External exposure context (+5) is supplied/inferred context, not verified internet reachability.",
++                "Version unknown; CVE applicability is unverified."
++              ],
++              "score_kind": "exposure_review_priority",
++              "severity": "info",
++              "verification_status": "observed",
++              "identity_confidence": "low",
++              "identity_reason": "Product or version is missing; identity is incomplete."
++            }
++          ]
++        }
++      ],
++      "observations": [
++        {
++          "host": "192.0.2.10",
++          "protocol": "tcp",
++          "port": 22,
++          "state": "open",
++          "service": "ssh",
++          "product": "OpenSSH",
++          "version": null,
++          "evidence": {
++            "source": "Nmap XML",
++            "artifact": "day4-example.xml",
++            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++            "host_addresses": [
++              {
++                "@addr": "192.0.2.10",
++                "@addrtype": "ipv4"
++              }
++            ],
++            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++            "original": {
++              "@protocol": "tcp",
++              "@portid": "22",
++              "state": {
++                "@state": "open",
++                "@reason": "syn-ack"
++              },
++              "service": {
++                "@name": "ssh",
++                "@product": "OpenSSH"
++              }
++            }
++          }
++        }
++      ],
++      "candidate_vulnerabilities": []
++    }
++  },
++  "supplied_candidate_demonstration": {
++    "data": {
++      "hosts": [
++        {
++          "ip": "192.0.2.10",
++          "hostnames": [],
++          "reverse_dns": null,
++          "mac": null,
++          "mac_vendor": null,
++          "os": [],
++          "services": [
++            {
++              "host": "192.0.2.10",
++              "port": 22,
++              "protocol": "tcp",
++              "state": "open",
++              "service": "ssh",
++              "product": "OpenSSH",
++              "version": null,
++              "extrainfo": null,
++              "nse_findings": [],
++              "evidence": {
++                "source": "Nmap XML",
++                "artifact": "day4-example.xml",
++                "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++                "host_addresses": [
++                  {
++                    "@addr": "192.0.2.10",
++                    "@addrtype": "ipv4"
++                  }
++                ],
++                "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++                "original": {
++                  "@protocol": "tcp",
++                  "@portid": "22",
++                  "state": {
++                    "@state": "open",
++                    "@reason": "syn-ack"
++                  },
++                  "service": {
++                    "@name": "ssh",
++                    "@product": "OpenSSH"
++                  }
++                }
++              },
++              "nvd": {
++                "keyword": "OpenSSH",
++                "cves": [
++                  {
++                    "id": "SYNTHETIC-CVE",
++                    "severity": "info",
++                    "score": null,
++                    "description": "Synthetic offline example candidate; not a real advisory.",
++                    "verification_status": "unverified",
++                    "confidence": "low",
++                    "applicability": {
++                      "status": "unverified",
++                      "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
++                    },
++                    "reported_severity": "CRITICAL",
++                    "reported_cvss": 9.8,
++                    "original": {
++                      "id": "SYNTHETIC-CVE",
++                      "severity": "CRITICAL",
++                      "score": 9.8,
++                      "description": "Synthetic offline example candidate; not a real advisory."
++                    },
++                    "match_method": "keyword"
++                  }
++                ],
++                "status": "unverified_candidates"
++              },
++              "ip": "192.0.2.10",
++              "weak_creds": {
++                "found": false,
++                "status": "not_tested"
++              },
++              "remediation": "Restrict SSH to authorized clients, prefer key-based authentication, and review vendor updates.",
++              "pcvp_score": 25,
++              "pcvp_level": "low",
++              "pcvp_reasons": [
++                "Observed open port (+10 review priority); this does not establish a vulnerability.",
++                "Administrative/data service (+10 review priority); no credential or compromise claim.",
++                "External exposure context (+5) is supplied/inferred context, not verified internet reachability.",
++                "Version unknown; CVE applicability is unverified.",
++                "CVE keyword candidates do not increase severity or review priority."
++              ],
++              "score_kind": "exposure_review_priority",
++              "severity": "info",
++              "verification_status": "observed",
++              "identity_confidence": "low",
++              "identity_reason": "Product or version is missing; identity is incomplete."
++            }
++          ]
++        }
++      ],
++      "observations": [
++        {
++          "host": "192.0.2.10",
++          "protocol": "tcp",
++          "port": 22,
++          "state": "open",
++          "service": "ssh",
++          "product": "OpenSSH",
++          "version": null,
++          "evidence": {
++            "source": "Nmap XML",
++            "artifact": "day4-example.xml",
++            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++            "host_addresses": [
++              {
++                "@addr": "192.0.2.10",
++                "@addrtype": "ipv4"
++              }
++            ],
++            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++            "original": {
++              "@protocol": "tcp",
++              "@portid": "22",
++              "state": {
++                "@state": "open",
++                "@reason": "syn-ack"
++              },
++              "service": {
++                "@name": "ssh",
++                "@product": "OpenSSH"
++              }
++            }
++          }
++        }
++      ],
++      "candidate_vulnerabilities": [
++        {
++          "domain": "network",
++          "asset": "192.0.2.10:22/tcp",
++          "severity": "info",
++          "confidence_scope": "CVE_applicability",
++          "observation": {
++            "host": "192.0.2.10",
++            "protocol": "tcp",
++            "port": 22,
++            "state": "open",
++            "service": "ssh",
++            "product": "OpenSSH",
++            "version": null,
++            "evidence": {
++              "source": "Nmap XML",
++              "artifact": "day4-example.xml",
++              "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++              "host_addresses": [
++                {
++                  "@addr": "192.0.2.10",
++                  "@addrtype": "ipv4"
++                }
++              ],
++              "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++              "original": {
++                "@protocol": "tcp",
++                "@portid": "22",
++                "state": {
++                  "@state": "open",
++                  "@reason": "syn-ack"
++                },
++                "service": {
++                  "@name": "ssh",
++                  "@product": "OpenSSH"
++                }
++              }
++            }
++          },
++          "original_evidence": {
++            "source": "Nmap XML",
++            "artifact": "day4-example.xml",
++            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++            "host_addresses": [
++              {
++                "@addr": "192.0.2.10",
++                "@addrtype": "ipv4"
++              }
++            ],
++            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++            "original": {
++              "@protocol": "tcp",
++              "@portid": "22",
++              "state": {
++                "@state": "open",
++                "@reason": "syn-ack"
++              },
++              "service": {
++                "@name": "ssh",
++                "@product": "OpenSSH"
++              }
++            }
++          },
++          "cvss": null,
++          "id": "SYNTHETIC-CVE-192.0.2.10-tcp-22",
++          "cve_id": "SYNTHETIC-CVE",
++          "category": "candidate_vulnerability",
++          "rule_id": "NET-CVE-KEYWORD-001",
++          "title": "Unverified CVE candidate: SYNTHETIC-CVE",
++          "confidence": "low",
++          "verification_status": "unverified",
++          "reported_severity": "CRITICAL",
++          "reported_cvss": 9.8,
++          "applicability": {
++            "status": "unverified",
++            "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
++          },
++          "evidence": "Keyword=OpenSSH; candidate description: Synthetic offline example candidate; not a real advisory.",
++          "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown.",
++          "candidate_evidence": {
++            "id": "SYNTHETIC-CVE",
++            "severity": "info",
++            "score": null,
++            "description": "Synthetic offline example candidate; not a real advisory.",
++            "verification_status": "unverified",
++            "confidence": "low",
++            "applicability": {
++              "status": "unverified",
++              "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
++            },
++            "reported_severity": "CRITICAL",
++            "reported_cvss": 9.8,
++            "original": {
++              "id": "SYNTHETIC-CVE",
++              "severity": "CRITICAL",
++              "score": 9.8,
++              "description": "Synthetic offline example candidate; not a real advisory."
++            },
++            "match_method": "keyword"
++          },
++          "remediation": "Verify the installed product, exact version, vendor advisory and affected-version conditions before treating this candidate as applicable.",
++          "source": "NVD keyword match (unverified)"
++        }
++      ]
++    },
++    "findings": [
++      {
++        "domain": "network",
++        "asset": "192.0.2.10:22/tcp",
++        "severity": "info",
++        "confidence_scope": "port_state_only",
++        "observation": {
++          "host": "192.0.2.10",
++          "protocol": "tcp",
++          "port": 22,
++          "state": "open",
++          "service": "ssh",
++          "product": "OpenSSH",
++          "version": null,
++          "evidence": {
++            "source": "Nmap XML",
++            "artifact": "day4-example.xml",
++            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++            "host_addresses": [
++              {
++                "@addr": "192.0.2.10",
++                "@addrtype": "ipv4"
++              }
++            ],
++            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++            "original": {
++              "@protocol": "tcp",
++              "@portid": "22",
++              "state": {
++                "@state": "open",
++                "@reason": "syn-ack"
++              },
++              "service": {
++                "@name": "ssh",
++                "@product": "OpenSSH"
++              }
++            }
++          }
++        },
++        "original_evidence": {
++          "source": "Nmap XML",
++          "artifact": "day4-example.xml",
++          "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++          "host_addresses": [
++            {
++              "@addr": "192.0.2.10",
++              "@addrtype": "ipv4"
++            }
++          ],
++          "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++          "original": {
++            "@protocol": "tcp",
++            "@portid": "22",
++            "state": {
++              "@state": "open",
++              "@reason": "syn-ack"
++            },
++            "service": {
++              "@name": "ssh",
++              "@product": "OpenSSH"
++            }
++          }
++        },
++        "cvss": null,
++        "id": "OBS-192.0.2.10-tcp-22",
++        "category": "observation",
++        "rule_id": "NET-OPEN-001",
++        "title": "Observed open service: ssh",
++        "confidence": "high",
++        "verification_status": "observed",
++        "evidence": "192.0.2.10:22/tcp state=open; product=OpenSSH; version=unknown",
++        "reason": "Nmap recorded this port as open. An open service is not a confirmed vulnerability. Version is unknown; no CVE applicability can be established.",
++        "remediation": "Confirm the service is required and restrict access to authorized clients.",
++        "source": "Nmap XML"
++      },
++      {
++        "domain": "network",
++        "asset": "192.0.2.10:22/tcp",
++        "severity": "info",
++        "confidence_scope": "CVE_applicability",
++        "observation": {
++          "host": "192.0.2.10",
++          "protocol": "tcp",
++          "port": 22,
++          "state": "open",
++          "service": "ssh",
++          "product": "OpenSSH",
++          "version": null,
++          "evidence": {
++            "source": "Nmap XML",
++            "artifact": "day4-example.xml",
++            "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++            "host_addresses": [
++              {
++                "@addr": "192.0.2.10",
++                "@addrtype": "ipv4"
++              }
++            ],
++            "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++            "original": {
++              "@protocol": "tcp",
++              "@portid": "22",
++              "state": {
++                "@state": "open",
++                "@reason": "syn-ack"
++              },
++              "service": {
++                "@name": "ssh",
++                "@product": "OpenSSH"
++              }
++            }
++          }
++        },
++        "original_evidence": {
++          "source": "Nmap XML",
++          "artifact": "day4-example.xml",
++          "sha256": "b091c61c882dc211c358ba126f5b895bc5e7d006bbf50daceb54c35985a2490a",
++          "host_addresses": [
++            {
++              "@addr": "192.0.2.10",
++              "@addrtype": "ipv4"
++            }
++          ],
++          "locator": "host[192.0.2.10]/ports/port[@protocol='tcp'][@portid='22']",
++          "original": {
++            "@protocol": "tcp",
++            "@portid": "22",
++            "state": {
++              "@state": "open",
++              "@reason": "syn-ack"
++            },
++            "service": {
++              "@name": "ssh",
++              "@product": "OpenSSH"
++            }
++          }
++        },
++        "cvss": null,
++        "id": "SYNTHETIC-CVE-192.0.2.10-tcp-22",
++        "cve_id": "SYNTHETIC-CVE",
++        "category": "candidate_vulnerability",
++        "rule_id": "NET-CVE-KEYWORD-001",
++        "title": "Unverified CVE candidate: SYNTHETIC-CVE",
++        "confidence": "low",
++        "verification_status": "unverified",
++        "reported_severity": "CRITICAL",
++        "reported_cvss": 9.8,
++        "applicability": {
++          "status": "unverified",
++          "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
++        },
++        "evidence": "Keyword=OpenSSH; candidate description: Synthetic offline example candidate; not a real advisory.",
++        "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown.",
++        "candidate_evidence": {
++          "id": "SYNTHETIC-CVE",
++          "severity": "info",
++          "score": null,
++          "description": "Synthetic offline example candidate; not a real advisory.",
++          "verification_status": "unverified",
++          "confidence": "low",
++          "applicability": {
++            "status": "unverified",
++            "reason": "Keyword matching does not establish product/version applicability. The observed version is unknown."
++          },
++          "reported_severity": "CRITICAL",
++          "reported_cvss": 9.8,
++          "original": {
++            "id": "SYNTHETIC-CVE",
++            "severity": "CRITICAL",
++            "score": 9.8,
++            "description": "Synthetic offline example candidate; not a real advisory."
++          },
++          "match_method": "keyword"
++        },
++        "remediation": "Verify the installed product, exact version, vendor advisory and affected-version conditions before treating this candidate as applicable.",
++        "source": "NVD keyword match (unverified)"
++      }
++    ]
++  }
++}
+\ No newline at end of file
